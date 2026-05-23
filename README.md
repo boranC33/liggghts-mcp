@@ -19,13 +19,16 @@ A thin MCP wrapper around the `liggghts` binary. Instead of hand-writing `.in` d
 |------|---------|
 | `start_simulation(input_script, num_procs, name)` | Launch a run from inline deck text |
 | `start_from_file(input_path, num_procs, name)` | Launch a run from an existing `.in` file |
-| `check_status(run_id)` | running / finished + exit code + last log line |
+| `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode)` | Snapshot a whole case dir (STL, .lammpstrj, .json, …) into the run dir, then run the deck inside it |
+| `run_plate_case(case_dir, pinn_root, name, postprocess)` | Orchestrate the plate-reference pipeline (`run_one_case.sh` settlement → plate_z0 recompute → intrusion, optional postprocess) on a case dir |
+| `check_status(run_id)` | running / finished + exit code + last log line (survives MCP restarts via `status.json`) |
 | `read_log(run_id, tail=200)` | Read the tail of `log.run` |
-| `list_dumps(run_id)` | List `*.dump`, `*.vtk`, `post/*` outputs |
-| `list_runs()` | Status of every known run |
+| `list_outputs(run_id, patterns)` | List `*.dump`, `*.lammpstrj`, `*.csv`, `*.json`, `*.log`, `log.*`, `screen.*`, `*.vtk`, `*.vtp`, `*.restart`, `post/*` (configurable) |
+| `list_dumps(run_id)` | Thin alias: dump/vtk/restart/post only |
+| `list_runs()` | Status of every known run (reads `status.json`) |
 | `stop_simulation(run_id)` | SIGTERM the run (SIGKILL if it ignores) |
 
-Each run lives in its own directory under `~/liggghts_runs/<run_id>/` with `input.in`, `log.run`, `pid`, plus whatever LIGGGHTS writes (`log.liggghts`, dumps, restart files).
+Each run lives in its own directory under `~/liggghts_runs/<run_id>/` with `input.in`, `log.run`, `pid`, `status.json`, plus whatever LIGGGHTS writes (`log.liggghts`, dumps, restart files). `status.json` records `started_at`, `finished_at`, `exit_code`, and `kind` so a finished run keeps its exit code across MCP server restarts.
 
 ### Prerequisites
 
@@ -110,13 +113,16 @@ MIT. LIGGGHTS itself is GPL-2; this wrapper does not link against LIGGGHTS code,
 |------|------|
 | `start_simulation(input_script, num_procs, name)` | 直接传 deck 文本，后台启动 |
 | `start_from_file(input_path, num_procs, name)` | 从已有 `.in` 文件启动 |
-| `check_status(run_id)` | running / finished + 退出码 + 最后一行日志 |
+| `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode)` | 把整个 case 目录（STL、.lammpstrj、.json 等）快照到 run dir 再跑 deck |
+| `run_plate_case(case_dir, pinn_root, name, postprocess)` | 一键跑完 plate-reference 流水线（`run_one_case.sh` settlement → plate_z0 重算 → intrusion，可选 postprocess） |
+| `check_status(run_id)` | running / finished + 退出码 + 最后一行日志（通过 `status.json` 跨 MCP 重启保留） |
 | `read_log(run_id, tail=200)` | 看 `log.run` 末尾 |
-| `list_dumps(run_id)` | 列出 dump / vtk / post 文件 |
-| `list_runs()` | 所有 case 的状态总览 |
+| `list_outputs(run_id, patterns)` | 列出 `*.dump`、`*.lammpstrj`、`*.csv`、`*.json`、`*.log`、`log.*`、`screen.*`、`*.vtk`、`*.vtp`、`*.restart`、`post/*`（可自定义模式） |
+| `list_dumps(run_id)` | 薄封装：仅 dump / vtk / restart / post |
+| `list_runs()` | 所有 case 的状态总览（读 `status.json`） |
 | `stop_simulation(run_id)` | SIGTERM (失败再 SIGKILL) |
 
-每个 run 独立目录在 `~/liggghts_runs/<run_id>/`，里面有 `input.in`、`log.run`、`pid`、以及 LIGGGHTS 自己写的 `log.liggghts` 和 dump 文件。
+每个 run 独立目录在 `~/liggghts_runs/<run_id>/`，里面有 `input.in`、`log.run`、`pid`、`status.json`、以及 LIGGGHTS 自己写的 `log.liggghts` 和 dump 文件。`status.json` 记录 `started_at` / `finished_at` / `exit_code` / `kind`，MCP server 重启后已完成 run 的退出码不会丢。
 
 ### 先决条件
 
