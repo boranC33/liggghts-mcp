@@ -21,7 +21,7 @@ A thin MCP wrapper around the `liggghts` binary. Instead of hand-writing `.in` d
 | `start_from_file(input_path, num_procs, name, overwrite)` | Launch a run from an existing `.in` file. Same `overwrite` semantics as `start_simulation` |
 | `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode, overwrite)` | Snapshot a whole case dir (STL, .lammpstrj, .json, …) into the run dir, then run the deck inside it. **`link_mode` defaults to `"copy"`** — `"symlink"` is only safe for read-only inputs (LIGGGHTS writes follow symlinks back into the source case dir and corrupt it). Same `overwrite` semantics as `start_simulation` |
 | `run_plate_case(case_dir, pinn_root, name, postprocess, overwrite)` | Orchestrate the plate-reference pipeline (`run_one_case.sh` settlement → plate_z0 recompute → intrusion, optional postprocess) on a case dir. Real outputs land **inside `case_dir`**, not the run dir — `status.json.case_dir_outputs` records the path so `list_outputs` can find them. When `postprocess=True`, postprocess is invoked with `--output {pinn_root}/outputs/plate_reference/{case_id}_summary.csv` (per-case, not the sweep-wide default) and that path is recorded in `status.json.summary_csv`. Same `overwrite` semantics as `start_simulation` |
-| `validate_liggghts_bin(run_parse_probe=False)` | Probe `LIGGGHTS_BIN`: exists / executable / version line / capability flags `mesh_surface` and `mesh_surface_stress`. When `run_parse_probe=True`, additionally execute a minimal self-contained deck (2-triangle STL + single `fix mesh/surface/stress ... stress on` line, no atoms, no `run`) inside a tempdir and report `mesh_surface_stress_parse_probe`, `parse_probe_exit_code`, `parse_probe_work_dir`, `parse_probe_error_tail`. The deck is intentionally bare so unrelated parser errors cannot pollute the signal — exit 0 means the fix style is present and its constructor succeeded; non-zero with "Invalid fix style" in the tail means the feature is missing. The grep-based `mesh_surface_stress` flag can be wrong in both directions, so the parse probe is the authoritative check. The plate workflow REQUIRES `mesh_surface_stress_parse_probe=true`; the apt LIGGGHTS package has `mesh/surface` but **not** `mesh/surface/stress` |
+| `validate_liggghts_bin(run_parse_probe=False)` | Probe `LIGGGHTS_BIN`: exists / executable / version line / capability flags `mesh_surface` and `mesh_surface_stress`. When `run_parse_probe=True`, additionally execute a minimal self-contained deck (2-triangle STL + single `fix mesh/surface/stress ... stress on` line, no atoms, no `run`) inside a tempdir and report `mesh_surface_stress_parse_probe`, `parse_probe_exit_code`, `parse_probe_work_dir`, `parse_probe_error_tail`. The deck is intentionally bare so unrelated parser errors cannot pollute the signal — exit 0 means the fix style is present and its constructor succeeded; non-zero with "Invalid fix style" in the tail means the feature is missing. The grep-based `mesh_surface_stress` flag can be wrong in both directions (some apt builds register `mesh/surface/stress` even though `-help` omits it; others list a style the parser rejects), so the parse probe is the authoritative check. The plate workflow REQUIRES `mesh_surface_stress_parse_probe=true` — always probe before assuming a build can or can't run plate cases |
 | `check_status(run_id)` | running / finished + exit code + last log line (survives MCP restarts via `status.json`) |
 | `read_log(run_id, tail=200)` | Read the tail of `log.run` |
 | `list_outputs(run_id, patterns, include_bookkeeping)` | List `*.dump`, `*.lammpstrj`, `*.csv`, `*.json`, `*.log`, `log.*`, `screen.*`, `*.vtk`, `*.vtp`, `*.restart`, `post/*` (configurable). Bookkeeping files (`pid`, `cmd`, `status.json`, `log.run`, `wrapper.sh`, `input.in`, `exit_code`) are excluded by default; pass `include_bookkeeping=True` to surface them — useful for reading `status.json` / `exit_code` directly when self-debugging |
@@ -82,6 +82,14 @@ claude mcp add -s user liggghts -- \
 # then start a fresh `claude` session — existing sessions hold the old tool list
 ```
 
+**Watch for stale stdio children.** `claude mcp remove`/`add` updates `.claude.json` but does **not** kill the existing stdio child process — the old `server.py` keeps serving until its PID is killed. After editing `server.py`, run:
+
+```bash
+pgrep -af 'liggghts-mcp.*server.py'
+```
+
+If you see a process started before your last edit, kill it manually (`kill <PID>`) before re-adding. Otherwise you'll keep getting v(N-1) behavior even though the file on disk is v(N).
+
 ### LIGGGHTS_BIN must be set in the MCP startup environment
 
 `LIGGGHTS_BIN` is read at server startup. Setting it only in your interactive shell does **not** propagate to the MCP child process — Claude Code launches the server from its own environment. Either:
@@ -95,9 +103,9 @@ claude mcp add -s user liggghts -- \
        /absolute/path/to/liggghts-mcp/server.py
   ```
 
-If a run fails to launch, call `validate_liggghts_bin()` first — it reports the resolved path, executability, version line, and two capability flags: `mesh_surface` (any `mesh/surface*` style is registered) and `mesh_surface_stress` (the plate workflow requires this — apt LIGGGHTS-PUBLIC 3.8.0 ships `mesh/surface` but is missing `mesh/surface/stress`, so source build is required for plate cases).
+If a run fails to launch, call `validate_liggghts_bin()` first — it reports the resolved path, executability, version line, and two capability flags: `mesh_surface` (any `mesh/surface*` style is registered) and `mesh_surface_stress` (grep against `liggghts -help`). The help-grep flag is unreliable in both directions: some apt builds of LIGGGHTS-PUBLIC 3.8.0 register `mesh/surface/stress` even though `-help` omits it, and other builds advertise styles the parser later rejects. Always confirm with the parse probe before deciding whether a binary can run plate cases.
 
-For a stricter check that catches builds where `-help` lists or omits the command incorrectly, pass `run_parse_probe=True`. The server creates a tempdir with a 2-triangle STL and a minimal deck containing **only** a `fix mesh/surface/stress ... stress on` line (no atoms, no pair_style, no `run`). If the fix-style constructor succeeds the deck exits 0; if the style isn't registered the deck exits non-zero with "Invalid fix style" in the tail. The deck is bare on purpose — unrelated parse errors (atom sorting, missing materials, etc.) cannot mask the capability signal. The tempdir is left on disk under `/tmp/liggghts_parse_probe_*` for debugging; check `parse_probe_error_tail` first if `mesh_surface_stress_parse_probe` is `false`.
+For a stricter check, pass `run_parse_probe=True`. The server creates a tempdir with a 2-triangle STL and a minimal deck containing **only** a `fix mesh/surface/stress ... stress on` line (no atoms, no pair_style, no `run`). If the fix-style constructor succeeds the deck exits 0; if the style isn't registered the deck exits non-zero with "Invalid fix style" in the tail. The deck is bare on purpose — unrelated parse errors (atom sorting, missing materials, etc.) cannot mask the capability signal. The tempdir is left on disk under `/tmp/liggghts_parse_probe_*` for debugging; check `parse_probe_error_tail` first if `mesh_surface_stress_parse_probe` is `false`. Treat `mesh_surface_stress_parse_probe` as the authoritative gate for the plate workflow — the help-grep `mesh_surface_stress` flag is just a fast hint and disagrees with reality on some builds.
 
 ### Usage examples
 
@@ -145,7 +153,7 @@ MIT. LIGGGHTS itself is GPL-2; this wrapper does not link against LIGGGHTS code,
 | `start_from_file(input_path, num_procs, name, overwrite)` | 从已有 `.in` 文件启动。`overwrite` 语义同 `start_simulation` |
 | `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode, overwrite)` | 把整个 case 目录（STL、.lammpstrj、.json 等）快照到 run dir 再跑 deck。**`link_mode` 默认 `"copy"`**；`"symlink"` 仅在输入只读时安全（LIGGGHTS 写入会沿 symlink 回写到原 case dir 把源文件损坏）。`overwrite` 语义同 `start_simulation` |
 | `run_plate_case(case_dir, pinn_root, name, postprocess, overwrite)` | 一键跑完 plate-reference 流水线（`run_one_case.sh` settlement → plate_z0 重算 → intrusion，可选 postprocess）。真实输出落在 **`case_dir` 内部**，不在 run dir，`status.json.case_dir_outputs` 记录该路径，`list_outputs` 据此能同时列出。`postprocess=True` 时调用 postprocess 会传 `--output {pinn_root}/outputs/plate_reference/{case_id}_summary.csv`（按 case 分文件，不再写到全 sweep 共用的默认路径），并把它记到 `status.json.summary_csv`。`overwrite` 语义同 `start_simulation` |
-| `validate_liggghts_bin(run_parse_probe=False)` | 探测 `LIGGGHTS_BIN`：是否存在 / 可执行 / 版本行 / 两个能力标志 `mesh_surface` 和 `mesh_surface_stress`。`run_parse_probe=True` 时在临时目录额外跑一个极简自包含 deck（2 三角片 STL + 单行 `fix mesh/surface/stress ... stress on`，没有 atoms，没有 `run`），返回 `mesh_surface_stress_parse_probe`、`parse_probe_exit_code`、`parse_probe_work_dir`、`parse_probe_error_tail`。deck 故意写得最小，避免不相关的 parse 错误污染信号 —— 退出码 0 表示 fix style 已注册且构造器成功；非 0 且 tail 里有 "Invalid fix style" 表示该 feature 缺失。grep `-help` 的 `mesh_surface_stress` 标志在两个方向都可能不准，parse probe 才是权威判定。plate 流水线必须 `mesh_surface_stress_parse_probe=true`；apt LIGGGHTS 只有 `mesh/surface` 没有 `mesh/surface/stress` |
+| `validate_liggghts_bin(run_parse_probe=False)` | 探测 `LIGGGHTS_BIN`：是否存在 / 可执行 / 版本行 / 两个能力标志 `mesh_surface` 和 `mesh_surface_stress`。`run_parse_probe=True` 时在临时目录额外跑一个极简自包含 deck（2 三角片 STL + 单行 `fix mesh/surface/stress ... stress on`，没有 atoms，没有 `run`），返回 `mesh_surface_stress_parse_probe`、`parse_probe_exit_code`、`parse_probe_work_dir`、`parse_probe_error_tail`。deck 故意写得最小，避免不相关的 parse 错误污染信号 —— 退出码 0 表示 fix style 已注册且构造器成功；非 0 且 tail 里有 "Invalid fix style" 表示该 feature 缺失。grep `-help` 的 `mesh_surface_stress` 标志在两个方向都可能不准（部分 apt LIGGGHTS-PUBLIC 3.8.0 实际注册了 `mesh/surface/stress` 但 `-help` 不列；其它 build 又会列出 parser 实际拒绝的 style），parse probe 才是权威判定。plate 流水线必须 `mesh_surface_stress_parse_probe=true` —— 在断言某个 build 能不能跑 plate 之前一定要先做 probe |
 | `check_status(run_id)` | running / finished + 退出码 + 最后一行日志（通过 `status.json` 跨 MCP 重启保留） |
 | `read_log(run_id, tail=200)` | 看 `log.run` 末尾 |
 | `list_outputs(run_id, patterns, include_bookkeeping)` | 列出 `*.dump`、`*.lammpstrj`、`*.csv`、`*.json`、`*.log`、`log.*`、`screen.*`、`*.vtk`、`*.vtp`、`*.restart`、`post/*`（可自定义模式）。bookkeeping 文件（`pid`、`cmd`、`status.json`、`log.run`、`wrapper.sh`、`input.in`、`exit_code`）默认排除；传 `include_bookkeeping=True` 才会一起列出 —— 适合 agent 自我调试时直接读 `status.json` / `exit_code` |
@@ -206,6 +214,14 @@ claude mcp add -s user liggghts -- \
 # 然后必须新开一个 claude 会话；已有会话仍持有旧的工具列表
 ```
 
+**注意残留的 stdio 子进程。** `claude mcp remove`/`add` 只更新 `.claude.json`，**不会**杀掉已经在跑的 stdio 子进程 —— 老的 `server.py` 还在为客户端服务，直到 PID 被手动杀掉。改完 `server.py` 之后跑：
+
+```bash
+pgrep -af 'liggghts-mcp.*server.py'
+```
+
+如果看到一个 PID 比你最近一次编辑还早，先 `kill <PID>` 再 re-add。否则磁盘上是 v(N)，行为还是 v(N-1)。
+
 ### `LIGGGHTS_BIN` 要写到 MCP 启动环境里
 
 `LIGGGHTS_BIN` 是在 server 启动时读取的。光在你交互 shell 里 `export` 不会传给 MCP 子进程 —— Claude Code 用它自己的环境启动 server。要么:
@@ -219,9 +235,9 @@ claude mcp add -s user liggghts -- \
        /绝对路径/liggghts-mcp/server.py
   ```
 
-仿真起不来时先调一次 `validate_liggghts_bin()` —— 它会返回真正解析到的路径、可执行性、版本行、以及两个能力标志：`mesh_surface`（注册了任何 `mesh/surface*` 风格命令）和 `mesh_surface_stress`（plate 流水线必须为 `true`；apt LIGGGHTS-PUBLIC 3.8.0 只有 `mesh/surface`，没有 `mesh/surface/stress`，所以 plate case 必须源码 build）。
+仿真起不来时先调一次 `validate_liggghts_bin()` —— 它会返回真正解析到的路径、可执行性、版本行、以及两个能力标志：`mesh_surface`（注册了任何 `mesh/surface*` 风格命令）和 `mesh_surface_stress`（grep `liggghts -help`）。help-grep 这个标志在两个方向都不可靠：部分 apt LIGGGHTS-PUBLIC 3.8.0 实际注册了 `mesh/surface/stress` 但 `-help` 不列；其它 build 又会列出 parser 实际拒绝的 style。要判断某个二进制能不能跑 plate case，一定要用 parse probe 确认，不要只看 help-grep 标志。
 
-如果某些 build 的 `-help` 文本不可信（漏列或错列 `mesh/surface/stress`），传 `run_parse_probe=True` 做更严格的检查：server 会在临时目录写一个 2 三角片 STL 和一个**只**包含一行 `fix mesh/surface/stress ... stress on` 的极简 deck（没有 atoms、没有 pair_style、没有 `run`）。如果 fix-style 构造器成功，deck 以 0 退出；如果该 style 没注册，deck 以非 0 退出，tail 里会有 "Invalid fix style"。deck 故意写得最小 —— 不相关的 parse 错误（atom sort、缺材料属性等）不会再掩盖能力信号。整个 probe 是自包含的 —— 不依赖 PINN 目录或项目 STL。临时目录会保留在 `/tmp/liggghts_parse_probe_*` 下方便 debug；`mesh_surface_stress_parse_probe=false` 时先看 `parse_probe_error_tail`。
+如果某些 build 的 `-help` 文本不可信（漏列或错列 `mesh/surface/stress`），传 `run_parse_probe=True` 做更严格的检查：server 会在临时目录写一个 2 三角片 STL 和一个**只**包含一行 `fix mesh/surface/stress ... stress on` 的极简 deck（没有 atoms、没有 pair_style、没有 `run`）。如果 fix-style 构造器成功，deck 以 0 退出；如果该 style 没注册，deck 以非 0 退出，tail 里会有 "Invalid fix style"。deck 故意写得最小 —— 不相关的 parse 错误（atom sort、缺材料属性等）不会再掩盖能力信号。整个 probe 是自包含的 —— 不依赖 PINN 目录或项目 STL。临时目录会保留在 `/tmp/liggghts_parse_probe_*` 下方便 debug；`mesh_surface_stress_parse_probe=false` 时先看 `parse_probe_error_tail`。plate 流水线只信 `mesh_surface_stress_parse_probe`，help-grep 的 `mesh_surface_stress` 只是个快速提示，部分 build 上会跟实际能力对不上。
 
 ### 使用示例
 
