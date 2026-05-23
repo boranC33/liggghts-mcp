@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Bundled LIGGGHTS shared libraries (users install via apt or build from source)
+lib/*.so
+lib/*.so.*
+
+# Run outputs
+liggghts_runs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
