@@ -240,8 +240,44 @@ fix             cad all mesh/surface/stress file plate_probe.stl type 1 stress o
 """
 
 
+_RUNTIME_PROBE_DECK = """\
+units           si
+atom_style      granular
+boundary        f f f
+newton          off
+communicate     single vel yes
+
+region          domain block -0.1 0.1 -0.1 0.1 -0.05 0.15 units box
+create_box      2 domain
+
+neigh_modify    delay 0
+
+fix             m1 all property/global youngsModulus peratomtype 5.0e6 5.0e6
+fix             m2 all property/global poissonsRatio peratomtype 0.45 0.45
+fix             m3 all property/global coefficientRestitution peratomtypepair 2 0.3 0.3 0.3 0.3
+fix             m4 all property/global coefficientFriction peratomtypepair 2 0.4 0.4 0.4 0.4
+
+pair_style      gran model hertz tangential history
+pair_coeff      * *
+
+fix             cad all mesh/surface/stress file plate_probe.stl type 2 stress on
+fix             plate_wall all wall/gran model hertz tangential history mesh n_meshes 1 meshes cad
+
+create_atoms    1 single 0.0 0.0 0.05 units box
+set             type 1 diameter 0.001 density 1000.0
+
+fix             integr all nve/sphere
+
+timestep        1e-6
+run             0
+"""
+
+
 @mcp.tool()
-def validate_liggghts_bin(run_parse_probe: bool = False) -> dict:
+def validate_liggghts_bin(
+    run_parse_probe: bool = False,
+    run_runtime_probe: bool = False,
+) -> dict:
     """Probe the configured LIGGGHTS binary and report whether it can run.
 
     Returns a dict with:
@@ -280,6 +316,33 @@ def validate_liggghts_bin(run_parse_probe: bool = False) -> dict:
       parse_probe_work_dir:            tempdir path (kept on disk for debug)
       parse_probe_error_tail:          last ~2KB of probe stdout+stderr;
                                        empty string when probe succeeded
+
+    `run_runtime_probe=True` is an INDEPENDENT capability check on top of the
+    parse probe. It executes a separate self-contained deck that adds:
+      - 2-type material property matrix (`property/global` Young / Poisson /
+        restitution / friction)
+      - `pair_style gran model hertz tangential history` + `pair_coeff * *`
+      - `fix wall/gran model hertz tangential history mesh n_meshes 1 meshes cad`
+      - one seed atom + `nve/sphere` integrator (LIGGGHTS refuses `run 0` with
+        zero atoms)
+      - `neigh_modify delay 0` (granular pair-style requirement)
+      - `timestep 1e-6` + `run 0`
+    so a `run 0` actually constructs the contact model and the mesh wall. This
+    catches builds where `mesh/surface/stress` parses fine but `wall/gran ...
+    mesh` or one of the granular material-property keywords is wired up
+    differently — failure modes the parse probe by design cannot see. The two
+    probes are orthogonal: each is bare-minimum for its own signal, so a
+    failure pinpoints which layer is broken instead of conflating parser-level
+    and runtime-level breakage. The deck is still self-contained — no project
+    files, no PINN dir.
+
+    When `run_runtime_probe=True` adds these extra fields:
+      runtime_probe_ok:         True iff the runtime probe deck exited 0
+      runtime_probe_exit_code:  probe `liggghts -in` exit code (or -1 on
+                                timeout / spawn failure)
+      runtime_probe_work_dir:   tempdir path (kept on disk for debug)
+      runtime_probe_error_tail: last ~2KB of probe stdout+stderr; empty
+                                string when probe succeeded
     """
     info: dict = {
         "liggghts_bin": LIGGGHTS_BIN,
@@ -335,6 +398,7 @@ def validate_liggghts_bin(run_parse_probe: bool = False) -> dict:
                 [LIGGGHTS_BIN, "-in", "probe.in"],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=30,
                 cwd=str(tmpdir),
                 env=_child_env(),
@@ -357,6 +421,40 @@ def validate_liggghts_bin(run_parse_probe: bool = False) -> dict:
             info["mesh_surface_stress_parse_probe"] = False
             info["parse_probe_exit_code"] = -1
             info["parse_probe_error_tail"] = f"failed to spawn liggghts: {e}"
+
+    if run_runtime_probe:
+        tmpdir = Path(tempfile.mkdtemp(prefix="liggghts_runtime_probe_"))
+        info["runtime_probe_work_dir"] = str(tmpdir)
+        (tmpdir / "plate_probe.stl").write_text(_PARSE_PROBE_STL)
+        (tmpdir / "probe.in").write_text(_RUNTIME_PROBE_DECK)
+        try:
+            rp = subprocess.run(
+                [LIGGGHTS_BIN, "-in", "probe.in"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=60,
+                cwd=str(tmpdir),
+                env=_child_env(),
+                stdin=subprocess.DEVNULL,
+            )
+            info["runtime_probe_exit_code"] = rp.returncode
+            tail_blob = (rp.stdout or "") + (rp.stderr or "")
+            info["runtime_probe_ok"] = rp.returncode == 0
+            info["runtime_probe_error_tail"] = (
+                "" if rp.returncode == 0 else tail_blob[-2048:]
+            )
+        except subprocess.TimeoutExpired as e:
+            info["runtime_probe_ok"] = False
+            info["runtime_probe_exit_code"] = -1
+            tail_blob = (e.stdout or "") + (e.stderr or "") if hasattr(e, "stdout") else ""
+            info["runtime_probe_error_tail"] = (
+                "TIMEOUT after 60s\n" + (tail_blob[-2048:] if tail_blob else "")
+            )
+        except OSError as e:
+            info["runtime_probe_ok"] = False
+            info["runtime_probe_exit_code"] = -1
+            info["runtime_probe_error_tail"] = f"failed to spawn liggghts: {e}"
     return info
 
 
