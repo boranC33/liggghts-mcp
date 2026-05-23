@@ -518,7 +518,7 @@ def run_plate_case(
     case_dir: str,
     pinn_root: str = "/home/boran/PINN",
     name: str | None = None,
-    postprocess: bool = True,
+    postprocess: bool = False,
     overwrite: bool = False,
 ) -> dict:
     """Run the full plate-reference pipeline in-place on a case dir.
@@ -534,10 +534,19 @@ def run_plate_case(
     run writes its own file instead of clobbering the sweep-wide default.
     The path is recorded as `status.summary_csv`.
 
+    NOTE: postprocess=True requires `basename(case_dir)` to be registered in
+    the PINN sweep manifest (default
+    `outputs/plate_reference/liggghts_plate_hpc_tier1_manifest.csv`). The
+    postprocessor filters manifest rows by `--case-id` and exits 2 if no row
+    matches — a 30+ minute simulation will succeed and then the postprocess
+    phase will fail. Smoke runs on arbitrary case dirs should leave the
+    default postprocess=False.
+
     case_dir:    absolute path to the case directory.
     pinn_root:   PINN repo root (default /home/boran/PINN).
     name:        optional run_id.
-    postprocess: also run the sweep postprocessor (default True).
+    postprocess: also run the sweep postprocessor (default False — only safe
+                 when basename(case_dir) is in the sweep manifest).
     overwrite:   if False (default), refuse to start when a run dir for
                  `name` already exists. If True, clear the existing dir
                  (only when the prior run is not currently running) before
