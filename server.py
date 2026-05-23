@@ -7,6 +7,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -209,8 +210,52 @@ def _launch(
     return status
 
 
+_PARSE_PROBE_STL = """\
+solid plate_probe
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex -0.05 -0.05 0.0
+      vertex  0.05 -0.05 0.0
+      vertex  0.05  0.05 0.0
+    endloop
+  endfacet
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex -0.05 -0.05 0.0
+      vertex  0.05  0.05 0.0
+      vertex -0.05  0.05 0.0
+    endloop
+  endfacet
+endsolid plate_probe
+"""
+
+
+_PARSE_PROBE_DECK = """\
+atom_style      granular
+atom_modify     map array
+boundary        f f f
+newton          off
+communicate     single vel yes
+units           si
+region          domain block -0.1 0.1 -0.1 0.1 -0.05 0.15 units box
+create_box      2 domain
+neighbor        0.001 bin
+neigh_modify    delay 0
+fix             m1 all property/global youngsModulus peratomtype 5.0e6 5.0e6
+fix             m2 all property/global poissonsRatio peratomtype 0.3 0.3
+fix             m3 all property/global coefficientRestitution peratomtypepair 2 0.5 0.5 0.5 0.5
+fix             m4 all property/global coefficientFriction peratomtypepair 2 0.3 0.3 0.3 0.3
+pair_style      gran model hertz tangential history
+pair_coeff      * *
+timestep        1e-6
+fix             cad all mesh/surface/stress file plate_probe.stl type 2 stress on
+fix             walls all wall/gran model hertz tangential history mesh n_meshes 1 meshes cad
+run             0
+"""
+
+
 @mcp.tool()
-def validate_liggghts_bin() -> dict:
+def validate_liggghts_bin(run_parse_probe: bool = False) -> dict:
     """Probe the configured LIGGGHTS binary and report whether it can run.
 
     Returns a dict with:
@@ -228,6 +273,22 @@ def validate_liggghts_bin() -> dict:
                                  v0.2.1 callers; will be removed in a future
                                  release).
       error:                     short error string when something fails
+
+    When `run_parse_probe=True`, additionally execute a tiny self-contained
+    deck (a 2-triangle STL plus a `mesh/surface/stress` + `wall/gran ... mesh`
+    + `run 0` deck) inside a tempdir to verify that the binary not only lists
+    the command in `-help` but actually parses and executes it. The grep-based
+    `mesh_surface_stress` flag can be wrong (some builds list the command in
+    help text but reject it at parse time). The probe never depends on any
+    project file or PINN directory.
+
+    When `run_parse_probe=True` adds these extra fields:
+      mesh_surface_stress_parse_probe: True iff the probe deck exited 0
+      parse_probe_exit_code:           probe `liggghts -in` exit code (or -1
+                                       if it timed out or failed to spawn)
+      parse_probe_work_dir:            tempdir path (kept on disk for debug)
+      parse_probe_error_tail:          last ~2KB of probe stdout+stderr;
+                                       empty string when probe succeeded
     """
     info: dict = {
         "liggghts_bin": LIGGGHTS_BIN,
@@ -272,6 +333,39 @@ def validate_liggghts_bin() -> dict:
     info["mesh_surface_stress"] = "mesh/surface/stress" in low
     info["mesh_surface"] = info["mesh_surface_stress"] or "mesh/surface" in low
     info["mesh_surface_stress_probe"] = info["mesh_surface_stress"]
+
+    if run_parse_probe:
+        tmpdir = Path(tempfile.mkdtemp(prefix="liggghts_parse_probe_"))
+        info["parse_probe_work_dir"] = str(tmpdir)
+        (tmpdir / "plate_probe.stl").write_text(_PARSE_PROBE_STL)
+        (tmpdir / "probe.in").write_text(_PARSE_PROBE_DECK)
+        try:
+            pp = subprocess.run(
+                [LIGGGHTS_BIN, "-in", "probe.in"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=str(tmpdir),
+                env=_child_env(),
+                stdin=subprocess.DEVNULL,
+            )
+            info["parse_probe_exit_code"] = pp.returncode
+            tail_blob = (pp.stdout or "") + (pp.stderr or "")
+            info["mesh_surface_stress_parse_probe"] = pp.returncode == 0
+            info["parse_probe_error_tail"] = (
+                "" if pp.returncode == 0 else tail_blob[-2048:]
+            )
+        except subprocess.TimeoutExpired as e:
+            info["mesh_surface_stress_parse_probe"] = False
+            info["parse_probe_exit_code"] = -1
+            tail_blob = (e.stdout or "") + (e.stderr or "") if hasattr(e, "stdout") else ""
+            info["parse_probe_error_tail"] = (
+                "TIMEOUT after 30s\n" + (tail_blob[-2048:] if tail_blob else "")
+            )
+        except OSError as e:
+            info["mesh_surface_stress_parse_probe"] = False
+            info["parse_probe_exit_code"] = -1
+            info["parse_probe_error_tail"] = f"failed to spawn liggghts: {e}"
     return info
 
 
