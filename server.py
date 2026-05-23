@@ -3,6 +3,7 @@ from mcp.server.fastmcp import FastMCP
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -107,25 +108,46 @@ def _last_log_line(wd: Path) -> str:
 def _finalize_if_done(run_id: str, wd: Path, status: dict) -> dict:
     """If status says running but the process is gone, persist finished + exit code.
 
+    Prefers the wrapper-written `exit_code` file (survives MCP restarts) over
+    `Popen.poll()` (only valid for the current MCP process).
+
     Returns updated status dict (mutated in place).
     """
     if status.get("status") != "running":
         return status
     pid = status.get("pid")
-    proc = _PROCS.get(run_id)
-    rc: int | None = None
-    if proc is not None:
-        rc = proc.poll()
-        if rc is None:
-            return status
+    file_rc = _read_exit_code_file(wd)
+    if file_rc is None:
+        # No exit_code file yet. If we have a live Popen handle, ask it.
+        # Otherwise, infer aliveness from /proc.
+        proc = _PROCS.get(run_id)
+        if proc is not None:
+            poll_rc = proc.poll()
+            if poll_rc is None:
+                return status
+            rc = poll_rc
+        else:
+            if pid is not None and _alive(pid):
+                return status
+            rc = None
     else:
-        if pid is not None and _alive(pid):
-            return status
+        rc = file_rc
     status["status"] = "finished"
     status["exit_code"] = rc
     status["finished_at"] = _now_iso()
     _write_status(wd, status)
     return status
+
+
+def _read_exit_code_file(wd: Path) -> int | None:
+    """Read the wrapper-persisted exit code, if present and parseable."""
+    f = wd / "exit_code"
+    if not f.exists():
+        return None
+    try:
+        return int(f.read_text().strip())
+    except (ValueError, OSError):
+        return None
 
 
 def _launch(
@@ -137,10 +159,32 @@ def _launch(
     env_extra: dict | None = None,
     cwd: Path | None = None,
 ) -> dict:
-    """Spawn a background process, write pid/cmd/status.json, register in _PROCS."""
+    """Spawn a background process, write pid/cmd/status.json, register in _PROCS.
+
+    Wraps `cmd` in a bash one-liner that captures the real exit code into
+    `<wd>/exit_code` after the child exits, so completion state survives MCP
+    server restarts (where in-process Popen handles in `_PROCS` are lost).
+    """
+    # Stale exit_code from any prior run in this dir would be misread by
+    # check_status as the current run's status — clear it before launch.
+    ec_file = wd / "exit_code"
+    if ec_file.exists():
+        try:
+            ec_file.unlink()
+        except OSError:
+            pass
+
+    quoted_cmd = shlex.join(cmd)
+    quoted_ec_path = shlex.quote(str(ec_file))
+    wrapper = (
+        f"set +e; {quoted_cmd}; rc=$?; "
+        f'printf "%s\\n" "$rc" > {quoted_ec_path}; exit "$rc"'
+    )
+    spawn_cmd = ["bash", "-c", wrapper]
+
     log = open(wd / "log.run", "w")
     proc = subprocess.Popen(
-        cmd,
+        spawn_cmd,
         cwd=cwd or wd,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -149,15 +193,14 @@ def _launch(
         env=_child_env(env_extra),
     )
     (wd / "pid").write_text(str(proc.pid))
-    cmd_str = " ".join(cmd)
-    (wd / "cmd").write_text(cmd_str)
+    (wd / "cmd").write_text(quoted_cmd)
     _PROCS[run_id] = proc
     status = {
         "run_id": run_id,
         "pid": proc.pid,
         "status": "running",
         "started_at": _now_iso(),
-        "cmd": cmd_str,
+        "cmd": quoted_cmd,
         "work_dir": str(wd),
     }
     if extra_status:
@@ -175,9 +218,15 @@ def validate_liggghts_bin() -> dict:
       exists:                    file is present
       executable:                file is executable by current user
       version_line:              first non-empty line of `liggghts -help` (or stderr)
-      mesh_surface_stress_probe: True if the binary's help text mentions
-                                 mesh/surface/stress (i.e. has the fixes the
-                                 plate workflow needs); None if probe failed
+      mesh_surface:              True if `mesh/surface` (any flavor) is present
+      mesh_surface_stress:       True if `mesh/surface/stress` specifically is
+                                 present — the plate workflow REQUIRES this.
+                                 Some apt builds expose `mesh/surface` but NOT
+                                 `mesh/surface/stress`, in which case the plate
+                                 pipeline will fail at deck parse time.
+      mesh_surface_stress_probe: alias of mesh_surface_stress (back-compat for
+                                 v0.2.1 callers; will be removed in a future
+                                 release).
       error:                     short error string when something fails
     """
     info: dict = {
@@ -185,6 +234,8 @@ def validate_liggghts_bin() -> dict:
         "exists": False,
         "executable": False,
         "version_line": None,
+        "mesh_surface": None,
+        "mesh_surface_stress": None,
         "mesh_surface_stress_probe": None,
     }
     p = Path(LIGGGHTS_BIN)
@@ -218,9 +269,9 @@ def validate_liggghts_bin() -> dict:
             info["version_line"] = s
             break
     low = blob.lower()
-    info["mesh_surface_stress_probe"] = (
-        "mesh/surface/stress" in low or "mesh/surface" in low
-    )
+    info["mesh_surface_stress"] = "mesh/surface/stress" in low
+    info["mesh_surface"] = info["mesh_surface_stress"] or "mesh/surface" in low
+    info["mesh_surface_stress_probe"] = info["mesh_surface_stress"]
     return info
 
 
@@ -274,10 +325,26 @@ def start_from_dir(
     deck_relpath: path to the LIGGGHTS input deck *relative to case_dir*.
     name:         optional run_id; auto-generated if omitted.
     num_procs:    >1 launches via mpirun -np N.
-    link_mode:    "copy" (default, isolated full copy) or "symlink"
-                  (file-by-file symlinks; outputs still land in run dir, but
-                  any pre-existing files of the same name in case_dir would be
-                  shadowed by writes — use only for read-only inputs).
+    link_mode:    "copy" (default, RECOMMENDED) makes a full isolated copy —
+                  the run dir is independent of the source. Outputs land in
+                  the run dir, source case_dir is untouched.
+
+                  "symlink" creates per-file symlinks INSTEAD of copies. This
+                  is dangerous when LIGGGHTS opens any of those files for
+                  writing or appending: the write follows the symlink and
+                  CORRUPTS the original file in case_dir. LIGGGHTS does this
+                  for things like restart files, fix print outputs, and any
+                  dump path that happens to collide with an existing input
+                  filename. Outputs that LIGGGHTS creates fresh (new
+                  filenames) are written into the run dir as expected.
+
+                  Use "symlink" ONLY when:
+                    - inputs are large and you want to avoid the copy cost,
+                    - AND you have audited the deck and confirmed it never
+                      writes to or modifies any input file path,
+                    - AND you accept the risk that a deck change later could
+                      silently overwrite the source case.
+                  When in doubt, stick with "copy".
     """
     src = Path(case_dir).expanduser().resolve()
     if not src.is_dir():
@@ -368,21 +435,27 @@ def run_plate_case(
     wd.mkdir(parents=True, exist_ok=True)
 
     # Wrapper script: run the pipeline, then optionally postprocess. Both
-    # phases share the same log.run via _launch's stdout redirect.
+    # phases share the same log.run via _launch's stdout redirect. All
+    # interpolated paths are shlex-quoted so spaces / special chars in
+    # case_dir or pinn_root don't corrupt the command.
     postproc = pinn / "scripts" / "postprocess_liggghts_plate_hpc_sweep.py"
+    q_runner = shlex.quote(str(runner))
+    q_case = shlex.quote(str(case))
+    q_case_id = shlex.quote(case_id)
     parts = [
         "set -e",
-        f'echo "[mcp] phase=run_one_case case_id={case_id}"',
-        f'bash {runner} {case}',
+        f'echo "[mcp] phase=run_one_case case_id={q_case_id}"',
+        f"bash {q_runner} {q_case}",
     ]
     if postprocess:
         if not postproc.is_file():
             raise FileNotFoundError(f"postprocess script not found: {postproc}")
+        q_postproc = shlex.quote(str(postproc))
         parts += [
-            f'echo "[mcp] phase=postprocess case_id={case_id}"',
-            f'python3 {postproc} --case-id {case_id}',
+            f'echo "[mcp] phase=postprocess case_id={q_case_id}"',
+            f"python3 {q_postproc} --case-id {q_case_id}",
         ]
-    parts.append(f'echo "[mcp] phase=done case_id={case_id}"')
+    parts.append(f'echo "[mcp] phase=done case_id={q_case_id}"')
     script = "\n".join(parts)
     (wd / "wrapper.sh").write_text(script)
 
@@ -400,6 +473,7 @@ def run_plate_case(
             "kind": "run_plate_case",
             "case_dir": str(case),
             "case_id": case_id,
+            "case_dir_outputs": str(case),
             "pinn_root": str(pinn),
             "postprocess": postprocess,
         },
@@ -466,17 +540,39 @@ def list_outputs(run_id: str, patterns: list[str] | None = None) -> list[str]:
     *.restart, post/*. Pass `patterns` to override.
 
     Excludes the MCP server's own bookkeeping files (pid, cmd, status.json,
-    log.run, wrapper.sh, input.in).
+    log.run, wrapper.sh, input.in, exit_code).
+
+    For runs of kind "run_plate_case", also globs `status.case_dir_outputs`
+    (the external case dir where `run_one_case.sh` actually writes outputs)
+    and merges those paths into the same sorted list. The MCP run dir for
+    plate runs only holds the wrapper + log; the real .csv / .lammpstrj /
+    .json land in the case dir.
     """
     wd = _run_dir(run_id)
     pats = patterns or list(_DEFAULT_OUTPUT_PATTERNS)
-    bookkeeping = {"pid", "cmd", "status.json", "log.run", "wrapper.sh", "input.in"}
+    bookkeeping = {
+        "pid", "cmd", "status.json", "log.run", "wrapper.sh", "input.in",
+        "exit_code",
+    }
     seen: set[str] = set()
-    for pat in pats:
-        for p in wd.glob(pat):
-            if p.name in bookkeeping:
-                continue
-            seen.add(str(p))
+
+    search_dirs = [wd]
+    status = _read_status(wd)
+    extra = status.get("case_dir_outputs")
+    if extra:
+        try:
+            extra_path = Path(extra).expanduser().resolve()
+        except (OSError, ValueError):
+            extra_path = None
+        if extra_path and extra_path.is_dir() and extra_path != wd.resolve():
+            search_dirs.append(extra_path)
+
+    for d in search_dirs:
+        for pat in pats:
+            for p in d.glob(pat):
+                if p.name in bookkeeping:
+                    continue
+                seen.add(str(p))
     return sorted(seen)
 
 
