@@ -232,25 +232,11 @@ endsolid plate_probe
 
 _PARSE_PROBE_DECK = """\
 atom_style      granular
-atom_modify     map array
-boundary        f f f
-newton          off
-communicate     single vel yes
 units           si
+boundary        f f f
 region          domain block -0.1 0.1 -0.1 0.1 -0.05 0.15 units box
-create_box      2 domain
-neighbor        0.001 bin
-neigh_modify    delay 0
-fix             m1 all property/global youngsModulus peratomtype 5.0e6 5.0e6
-fix             m2 all property/global poissonsRatio peratomtype 0.3 0.3
-fix             m3 all property/global coefficientRestitution peratomtypepair 2 0.5 0.5 0.5 0.5
-fix             m4 all property/global coefficientFriction peratomtypepair 2 0.3 0.3 0.3 0.3
-pair_style      gran model hertz tangential history
-pair_coeff      * *
-timestep        1e-6
-fix             cad all mesh/surface/stress file plate_probe.stl type 2 stress on
-fix             walls all wall/gran model hertz tangential history mesh n_meshes 1 meshes cad
-run             0
+create_box      1 domain
+fix             cad all mesh/surface/stress file plate_probe.stl type 1 stress on
 """
 
 
@@ -274,13 +260,18 @@ def validate_liggghts_bin(run_parse_probe: bool = False) -> dict:
                                  release).
       error:                     short error string when something fails
 
-    When `run_parse_probe=True`, additionally execute a tiny self-contained
-    deck (a 2-triangle STL plus a `mesh/surface/stress` + `wall/gran ... mesh`
-    + `run 0` deck) inside a tempdir to verify that the binary not only lists
-    the command in `-help` but actually parses and executes it. The grep-based
-    `mesh_surface_stress` flag can be wrong (some builds list the command in
-    help text but reject it at parse time). The probe never depends on any
-    project file or PINN directory.
+    When `run_parse_probe=True`, additionally execute a minimal self-contained
+    deck (a 2-triangle STL + a single `fix mesh/surface/stress ... stress on`
+    line) inside a tempdir to verify the binary actually accepts that fix at
+    parse time. The deck is intentionally bare — no atoms, no pair_style, no
+    `run` — so unrelated parser errors (atom-sort bin sizing, missing material
+    properties, etc.) cannot pollute the signal. Exit 0 = fix style present
+    and constructor succeeded (STL was read); non-zero with "Invalid fix
+    style" in the tail = feature missing. The grep-based `mesh_surface_stress`
+    flag can be wrong in BOTH directions on apt builds — `-help` may omit a
+    style that actually works, or list one the parser rejects — so the parse
+    probe is the authoritative signal. The probe never depends on any project
+    file or PINN directory.
 
     When `run_parse_probe=True` adds these extra fields:
       mesh_surface_stress_parse_probe: True iff the probe deck exited 0
