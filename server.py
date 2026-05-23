@@ -280,18 +280,32 @@ def start_simulation(
     input_script: str,
     num_procs: int = 1,
     name: str | None = None,
+    overwrite: bool = False,
 ) -> dict:
     """Start LIGGGHTS in the background and return a run_id immediately.
 
     input_script: full text of the LIGGGHTS input deck (written to input.in).
     num_procs:    >1 launches via mpirun -np N.
     name:         optional run_id; auto-generated if omitted.
+    overwrite:    if False (default), refuse to start when a run dir for
+                  `name` already exists. If True, clear the existing dir
+                  (only when the prior run is not currently running) before
+                  starting. A still-running prior run is always rejected
+                  regardless of this flag.
     """
     run_id = name or uuid.uuid4().hex[:8]
     wd = _run_dir(run_id)
-    if wd.exists() and (pid := _read_pid(wd)) and _alive(pid):
-        raise RuntimeError(f"run_id {run_id} is already running")
-    wd.mkdir(parents=True, exist_ok=True)
+    if wd.exists():
+        pid = _read_pid(wd)
+        if pid and _alive(pid):
+            raise RuntimeError(f"run_id {run_id} is already running")
+        if not overwrite:
+            raise RuntimeError(
+                f"run_id {run_id} already exists at {wd}; "
+                f"pass overwrite=True to clear it or choose a different name"
+            )
+        shutil.rmtree(wd)
+    wd.mkdir(parents=True)
     (wd / "input.in").write_text(input_script)
 
     cmd = [LIGGGHTS_BIN, "-in", "input.in"]
@@ -302,12 +316,19 @@ def start_simulation(
 
 
 @mcp.tool()
-def start_from_file(input_path: str, num_procs: int = 1, name: str | None = None) -> dict:
+def start_from_file(
+    input_path: str,
+    num_procs: int = 1,
+    name: str | None = None,
+    overwrite: bool = False,
+) -> dict:
     """Start a run from an existing input deck file. Copies it into the run dir."""
     src = Path(input_path).expanduser().resolve()
     if not src.is_file():
         raise FileNotFoundError(input_path)
-    return start_simulation(src.read_text(), num_procs=num_procs, name=name)
+    return start_simulation(
+        src.read_text(), num_procs=num_procs, name=name, overwrite=overwrite
+    )
 
 
 @mcp.tool()
@@ -317,6 +338,7 @@ def start_from_dir(
     name: str | None = None,
     num_procs: int = 1,
     link_mode: str = "copy",
+    overwrite: bool = False,
 ) -> dict:
     """Snapshot a whole case directory into the run dir, then run LIGGGHTS on a deck inside it.
 
@@ -345,6 +367,11 @@ def start_from_dir(
                     - AND you accept the risk that a deck change later could
                       silently overwrite the source case.
                   When in doubt, stick with "copy".
+    overwrite:    if False (default), refuse to start when a run dir for
+                  `name` already exists. If True, clear the existing dir
+                  (only when the prior run is not currently running) before
+                  re-snapshotting. A still-running prior run is always
+                  rejected regardless of this flag.
     """
     src = Path(case_dir).expanduser().resolve()
     if not src.is_dir():
@@ -359,9 +386,15 @@ def start_from_dir(
 
     run_id = name or uuid.uuid4().hex[:8]
     wd = _run_dir(run_id)
-    if wd.exists() and (pid := _read_pid(wd)) and _alive(pid):
-        raise RuntimeError(f"run_id {run_id} is already running")
     if wd.exists():
+        pid = _read_pid(wd)
+        if pid and _alive(pid):
+            raise RuntimeError(f"run_id {run_id} is already running")
+        if not overwrite:
+            raise RuntimeError(
+                f"run_id {run_id} already exists at {wd}; "
+                f"pass overwrite=True to clear it or choose a different name"
+            )
         shutil.rmtree(wd)
 
     if link_mode == "copy":
@@ -401,6 +434,7 @@ def run_plate_case(
     pinn_root: str = "/home/boran/PINN",
     name: str | None = None,
     postprocess: bool = True,
+    overwrite: bool = False,
 ) -> dict:
     """Run the full plate-reference pipeline in-place on a case dir.
 
@@ -410,12 +444,22 @@ def run_plate_case(
     MCP run dir's log.run.
 
     If postprocess=True, also runs scripts/postprocess_liggghts_plate_hpc_sweep.py
-    --case-id <basename(case_dir)> after the LIGGGHTS pipeline finishes.
+    --case-id <basename(case_dir)> --output <per-case csv>. The per-case CSV
+    lives at `{pinn}/outputs/plate_reference/{case_id}_summary.csv` so each
+    run writes its own file instead of clobbering the sweep-wide default.
+    The path is recorded as `status.summary_csv`.
 
     case_dir:    absolute path to the case directory.
     pinn_root:   PINN repo root (default /home/boran/PINN).
     name:        optional run_id.
     postprocess: also run the sweep postprocessor (default True).
+    overwrite:   if False (default), refuse to start when a run dir for
+                 `name` already exists. If True, clear the existing dir
+                 (only when the prior run is not currently running) before
+                 starting. A still-running prior run is always rejected
+                 regardless of this flag. Note: this only affects the MCP
+                 run dir; outputs the runner writes into `case_dir` itself
+                 are not touched.
     """
     case = Path(case_dir).expanduser().resolve()
     if not case.is_dir():
@@ -430,15 +474,24 @@ def run_plate_case(
     case_id = case.name
     run_id = name or f"plate_{case_id}_{uuid.uuid4().hex[:6]}"
     wd = _run_dir(run_id)
-    if wd.exists() and (pid := _read_pid(wd)) and _alive(pid):
-        raise RuntimeError(f"run_id {run_id} is already running")
-    wd.mkdir(parents=True, exist_ok=True)
+    if wd.exists():
+        pid = _read_pid(wd)
+        if pid and _alive(pid):
+            raise RuntimeError(f"run_id {run_id} is already running")
+        if not overwrite:
+            raise RuntimeError(
+                f"run_id {run_id} already exists at {wd}; "
+                f"pass overwrite=True to clear it or choose a different name"
+            )
+        shutil.rmtree(wd)
+    wd.mkdir(parents=True)
 
     # Wrapper script: run the pipeline, then optionally postprocess. Both
     # phases share the same log.run via _launch's stdout redirect. All
     # interpolated paths are shlex-quoted so spaces / special chars in
     # case_dir or pinn_root don't corrupt the command.
     postproc = pinn / "scripts" / "postprocess_liggghts_plate_hpc_sweep.py"
+    summary_csv = pinn / "outputs" / "plate_reference" / f"{case_id}_summary.csv"
     q_runner = shlex.quote(str(runner))
     q_case = shlex.quote(str(case))
     q_case_id = shlex.quote(case_id)
@@ -451,13 +504,26 @@ def run_plate_case(
         if not postproc.is_file():
             raise FileNotFoundError(f"postprocess script not found: {postproc}")
         q_postproc = shlex.quote(str(postproc))
+        q_summary_csv = shlex.quote(str(summary_csv))
         parts += [
             f'echo "[mcp] phase=postprocess case_id={q_case_id}"',
-            f"python3 {q_postproc} --case-id {q_case_id}",
+            f"mkdir -p {shlex.quote(str(summary_csv.parent))}",
+            f"python3 {q_postproc} --case-id {q_case_id} --output {q_summary_csv}",
         ]
     parts.append(f'echo "[mcp] phase=done case_id={q_case_id}"')
     script = "\n".join(parts)
     (wd / "wrapper.sh").write_text(script)
+
+    extra_status = {
+        "kind": "run_plate_case",
+        "case_dir": str(case),
+        "case_id": case_id,
+        "case_dir_outputs": str(case),
+        "pinn_root": str(pinn),
+        "postprocess": postprocess,
+    }
+    if postprocess:
+        extra_status["summary_csv"] = str(summary_csv)
 
     cmd = ["bash", str(wd / "wrapper.sh")]
     return _launch(
@@ -469,14 +535,7 @@ def run_plate_case(
             "LIGGGHTS_BIN": LIGGGHTS_BIN,
             "PINN_ROOT": str(pinn),
         },
-        extra_status={
-            "kind": "run_plate_case",
-            "case_dir": str(case),
-            "case_id": case_id,
-            "case_dir_outputs": str(case),
-            "pinn_root": str(pinn),
-            "postprocess": postprocess,
-        },
+        extra_status=extra_status,
     )
 
 
@@ -532,15 +591,21 @@ _DEFAULT_OUTPUT_PATTERNS = (
 
 
 @mcp.tool()
-def list_outputs(run_id: str, patterns: list[str] | None = None) -> list[str]:
+def list_outputs(
+    run_id: str,
+    patterns: list[str] | None = None,
+    include_bookkeeping: bool = False,
+) -> list[str]:
     """List output files in a run dir matching the given glob patterns.
 
     Default patterns cover dumps, trajectories, CSV/JSON summaries, and logs:
     *.dump, *.lammpstrj, *.csv, *.json, *.log, log.*, screen.*, *.vtk, *.vtp,
     *.restart, post/*. Pass `patterns` to override.
 
-    Excludes the MCP server's own bookkeeping files (pid, cmd, status.json,
-    log.run, wrapper.sh, input.in, exit_code).
+    By default excludes the MCP server's own bookkeeping files (pid, cmd,
+    status.json, log.run, wrapper.sh, input.in, exit_code). Pass
+    `include_bookkeeping=True` to surface them — useful for the agent to
+    self-debug by reading status.json / exit_code / log.run directly.
 
     For runs of kind "run_plate_case", also globs `status.case_dir_outputs`
     (the external case dir where `run_one_case.sh` actually writes outputs)
@@ -570,7 +635,7 @@ def list_outputs(run_id: str, patterns: list[str] | None = None) -> list[str]:
     for d in search_dirs:
         for pat in pats:
             for p in d.glob(pat):
-                if p.name in bookkeeping:
+                if not include_bookkeeping and p.name in bookkeeping:
                     continue
                 seen.add(str(p))
     return sorted(seen)
@@ -610,7 +675,13 @@ def list_runs() -> list[dict]:
 
 @mcp.tool()
 def stop_simulation(run_id: str) -> dict:
-    """Send SIGTERM to a running simulation (SIGKILL if it ignores)."""
+    """Send SIGTERM to a running simulation (SIGKILL if it ignores).
+
+    Records `terminated_by_mcp: true` and `termination_signal:
+    "SIGTERM"|"SIGKILL"` in status.json so postprocess steps can distinguish
+    a user-requested stop from a simulation crash. SIGTERM is recorded if the
+    process exited within the 2s grace period; SIGKILL otherwise.
+    """
     wd = _run_dir(run_id)
     pid = _read_pid(wd)
     if pid is None or not _alive(pid):
@@ -624,20 +695,29 @@ def stop_simulation(run_id: str) -> dict:
         time.sleep(0.1)
         if not _alive(pid):
             break
+    sig_used = "SIGTERM"
     if _alive(pid):
         try:
             os.killpg(os.getpgid(pid), signal.SIGKILL)
+            sig_used = "SIGKILL"
         except ProcessLookupError:
             pass
     status = _read_status(wd)
     if status:
         status = _finalize_if_done(run_id, wd, status)
+        status["terminated_by_mcp"] = True
+        status["termination_signal"] = sig_used
         if status.get("status") == "running":
             status["status"] = "finished"
             status["finished_at"] = _now_iso()
             status["exit_code"] = status.get("exit_code", -signal.SIGTERM)
-            _write_status(wd, status)
-    return {"run_id": run_id, "status": "terminated", "pid": pid}
+        _write_status(wd, status)
+    return {
+        "run_id": run_id,
+        "status": "terminated",
+        "pid": pid,
+        "termination_signal": sig_used,
+    }
 
 
 if __name__ == "__main__":

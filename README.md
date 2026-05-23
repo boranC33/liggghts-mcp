@@ -17,17 +17,17 @@ A thin MCP wrapper around the `liggghts` binary. Instead of hand-writing `.in` d
 
 | Tool | Purpose |
 |------|---------|
-| `start_simulation(input_script, num_procs, name)` | Launch a run from inline deck text |
-| `start_from_file(input_path, num_procs, name)` | Launch a run from an existing `.in` file |
-| `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode)` | Snapshot a whole case dir (STL, .lammpstrj, .json, …) into the run dir, then run the deck inside it. **`link_mode` defaults to `"copy"`** — `"symlink"` is only safe for read-only inputs (LIGGGHTS writes follow symlinks back into the source case dir and corrupt it) |
-| `run_plate_case(case_dir, pinn_root, name, postprocess)` | Orchestrate the plate-reference pipeline (`run_one_case.sh` settlement → plate_z0 recompute → intrusion, optional postprocess) on a case dir. Real outputs land **inside `case_dir`**, not the run dir — `status.json.case_dir_outputs` records the path so `list_outputs` can find them |
+| `start_simulation(input_script, num_procs, name, overwrite)` | Launch a run from inline deck text. **`overwrite=False`** by default: a `run_id` whose run dir already exists (even from a finished run) is rejected with a clear error; pass `overwrite=True` to clear it first. A still-running prior run is always rejected regardless of the flag |
+| `start_from_file(input_path, num_procs, name, overwrite)` | Launch a run from an existing `.in` file. Same `overwrite` semantics as `start_simulation` |
+| `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode, overwrite)` | Snapshot a whole case dir (STL, .lammpstrj, .json, …) into the run dir, then run the deck inside it. **`link_mode` defaults to `"copy"`** — `"symlink"` is only safe for read-only inputs (LIGGGHTS writes follow symlinks back into the source case dir and corrupt it). Same `overwrite` semantics as `start_simulation` |
+| `run_plate_case(case_dir, pinn_root, name, postprocess, overwrite)` | Orchestrate the plate-reference pipeline (`run_one_case.sh` settlement → plate_z0 recompute → intrusion, optional postprocess) on a case dir. Real outputs land **inside `case_dir`**, not the run dir — `status.json.case_dir_outputs` records the path so `list_outputs` can find them. When `postprocess=True`, postprocess is invoked with `--output {pinn_root}/outputs/plate_reference/{case_id}_summary.csv` (per-case, not the sweep-wide default) and that path is recorded in `status.json.summary_csv`. Same `overwrite` semantics as `start_simulation` |
 | `validate_liggghts_bin()` | Probe `LIGGGHTS_BIN`: exists / executable / version line / capability flags `mesh_surface` and `mesh_surface_stress`. The plate workflow REQUIRES `mesh_surface_stress=true`; the apt LIGGGHTS package has `mesh/surface` but **not** `mesh/surface/stress` |
 | `check_status(run_id)` | running / finished + exit code + last log line (survives MCP restarts via `status.json`) |
 | `read_log(run_id, tail=200)` | Read the tail of `log.run` |
-| `list_outputs(run_id, patterns)` | List `*.dump`, `*.lammpstrj`, `*.csv`, `*.json`, `*.log`, `log.*`, `screen.*`, `*.vtk`, `*.vtp`, `*.restart`, `post/*` (configurable) |
+| `list_outputs(run_id, patterns, include_bookkeeping)` | List `*.dump`, `*.lammpstrj`, `*.csv`, `*.json`, `*.log`, `log.*`, `screen.*`, `*.vtk`, `*.vtp`, `*.restart`, `post/*` (configurable). Bookkeeping files (`pid`, `cmd`, `status.json`, `log.run`, `wrapper.sh`, `input.in`, `exit_code`) are excluded by default; pass `include_bookkeeping=True` to surface them — useful for reading `status.json` / `exit_code` directly when self-debugging |
 | `list_dumps(run_id)` | Thin alias: dump/vtk/restart/post only |
 | `list_runs()` | Status of every known run (reads `status.json`) |
-| `stop_simulation(run_id)` | SIGTERM the run (SIGKILL if it ignores) |
+| `stop_simulation(run_id)` | SIGTERM the run (SIGKILL if it ignores). Records `terminated_by_mcp: true` and `termination_signal: "SIGTERM"\|"SIGKILL"` in `status.json` so postprocess can distinguish a user-requested stop from a simulation crash |
 
 Each run lives in its own directory under `~/liggghts_runs/<run_id>/` with `input.in`, `log.run`, `pid`, `status.json`, plus whatever LIGGGHTS writes (`log.liggghts`, dumps, restart files). The launch wrapper writes the child process's exit code to `<run_dir>/exit_code` after the command finishes, and `status.json` records `started_at`, `finished_at`, `exit_code`, `kind`, and `case_dir_outputs` (for `run_plate_case`) — so a finished run keeps its exit code across MCP server restarts even if `Popen.poll()` is no longer available.
 
@@ -139,17 +139,17 @@ MIT. LIGGGHTS itself is GPL-2; this wrapper does not link against LIGGGHTS code,
 
 | 工具 | 用途 |
 |------|------|
-| `start_simulation(input_script, num_procs, name)` | 直接传 deck 文本，后台启动 |
-| `start_from_file(input_path, num_procs, name)` | 从已有 `.in` 文件启动 |
-| `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode)` | 把整个 case 目录（STL、.lammpstrj、.json 等）快照到 run dir 再跑 deck。**`link_mode` 默认 `"copy"`**；`"symlink"` 仅在输入只读时安全（LIGGGHTS 写入会沿 symlink 回写到原 case dir 把源文件损坏） |
-| `run_plate_case(case_dir, pinn_root, name, postprocess)` | 一键跑完 plate-reference 流水线（`run_one_case.sh` settlement → plate_z0 重算 → intrusion，可选 postprocess）。真实输出落在 **`case_dir` 内部**，不在 run dir，`status.json.case_dir_outputs` 记录该路径，`list_outputs` 据此能同时列出 |
+| `start_simulation(input_script, num_procs, name, overwrite)` | 直接传 deck 文本，后台启动。**`overwrite=False`** 默认：`run_id` 对应目录已存在（即使是已完成的 run）会直接报错；传 `overwrite=True` 才会清掉重来。还在运行的旧 run 永远拒绝，跟 flag 无关 |
+| `start_from_file(input_path, num_procs, name, overwrite)` | 从已有 `.in` 文件启动。`overwrite` 语义同 `start_simulation` |
+| `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode, overwrite)` | 把整个 case 目录（STL、.lammpstrj、.json 等）快照到 run dir 再跑 deck。**`link_mode` 默认 `"copy"`**；`"symlink"` 仅在输入只读时安全（LIGGGHTS 写入会沿 symlink 回写到原 case dir 把源文件损坏）。`overwrite` 语义同 `start_simulation` |
+| `run_plate_case(case_dir, pinn_root, name, postprocess, overwrite)` | 一键跑完 plate-reference 流水线（`run_one_case.sh` settlement → plate_z0 重算 → intrusion，可选 postprocess）。真实输出落在 **`case_dir` 内部**，不在 run dir，`status.json.case_dir_outputs` 记录该路径，`list_outputs` 据此能同时列出。`postprocess=True` 时调用 postprocess 会传 `--output {pinn_root}/outputs/plate_reference/{case_id}_summary.csv`（按 case 分文件，不再写到全 sweep 共用的默认路径），并把它记到 `status.json.summary_csv`。`overwrite` 语义同 `start_simulation` |
 | `validate_liggghts_bin()` | 探测 `LIGGGHTS_BIN`：是否存在 / 可执行 / 版本行 / 两个能力标志 `mesh_surface` 和 `mesh_surface_stress`。plate 流水线必须 `mesh_surface_stress=true`；apt LIGGGHTS 只有 `mesh/surface` 没有 `mesh/surface/stress` |
 | `check_status(run_id)` | running / finished + 退出码 + 最后一行日志（通过 `status.json` 跨 MCP 重启保留） |
 | `read_log(run_id, tail=200)` | 看 `log.run` 末尾 |
-| `list_outputs(run_id, patterns)` | 列出 `*.dump`、`*.lammpstrj`、`*.csv`、`*.json`、`*.log`、`log.*`、`screen.*`、`*.vtk`、`*.vtp`、`*.restart`、`post/*`（可自定义模式） |
+| `list_outputs(run_id, patterns, include_bookkeeping)` | 列出 `*.dump`、`*.lammpstrj`、`*.csv`、`*.json`、`*.log`、`log.*`、`screen.*`、`*.vtk`、`*.vtp`、`*.restart`、`post/*`（可自定义模式）。bookkeeping 文件（`pid`、`cmd`、`status.json`、`log.run`、`wrapper.sh`、`input.in`、`exit_code`）默认排除；传 `include_bookkeeping=True` 才会一起列出 —— 适合 agent 自我调试时直接读 `status.json` / `exit_code` |
 | `list_dumps(run_id)` | 薄封装：仅 dump / vtk / restart / post |
 | `list_runs()` | 所有 case 的状态总览（读 `status.json`） |
-| `stop_simulation(run_id)` | SIGTERM (失败再 SIGKILL) |
+| `stop_simulation(run_id)` | SIGTERM (失败再 SIGKILL)。会在 `status.json` 写入 `terminated_by_mcp: true` 和 `termination_signal: "SIGTERM"\|"SIGKILL"`，让后处理能区分"用户主动停"和"仿真崩了" |
 
 每个 run 独立目录在 `~/liggghts_runs/<run_id>/`，里面有 `input.in`、`log.run`、`pid`、`status.json`、以及 LIGGGHTS 自己写的 `log.liggghts` 和 dump 文件。启动 wrapper 在子进程结束时把退出码写入 `<run_dir>/exit_code`，`status.json` 记录 `started_at` / `finished_at` / `exit_code` / `kind` / `case_dir_outputs`（`run_plate_case` 才有），即使 MCP server 重启导致 `Popen.poll()` 不可用，已完成 run 的退出码也不会丢。
 

@@ -12,6 +12,7 @@ lib/*.so.*
 
 # Run outputs
 liggghts_runs/
+log.liggghts
 
 # Editor / OS
 .vscode/
