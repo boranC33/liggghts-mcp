@@ -21,6 +21,7 @@ A thin MCP wrapper around the `liggghts` binary. Instead of hand-writing `.in` d
 | `start_from_file(input_path, num_procs, name)` | Launch a run from an existing `.in` file |
 | `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode)` | Snapshot a whole case dir (STL, .lammpstrj, .json, …) into the run dir, then run the deck inside it |
 | `run_plate_case(case_dir, pinn_root, name, postprocess)` | Orchestrate the plate-reference pipeline (`run_one_case.sh` settlement → plate_z0 recompute → intrusion, optional postprocess) on a case dir |
+| `validate_liggghts_bin()` | Probe `LIGGGHTS_BIN`: exists / executable / version line / `mesh/surface/stress` capability — call this first if `start_simulation` fails to launch |
 | `check_status(run_id)` | running / finished + exit code + last log line (survives MCP restarts via `status.json`) |
 | `read_log(run_id, tail=200)` | Read the tail of `log.run` |
 | `list_outputs(run_id, patterns)` | List `*.dump`, `*.lammpstrj`, `*.csv`, `*.json`, `*.log`, `log.*`, `screen.*`, `*.vtk`, `*.vtp`, `*.restart`, `post/*` (configurable) |
@@ -69,6 +70,33 @@ claude mcp list
 
 Open a new Claude Code session and the 7 tools become available.
 
+### Reloading after an upgrade
+
+After `git pull` (or any code change), Claude Code's MCP client keeps the old server alive. To pick up new tools:
+
+```bash
+claude mcp remove liggghts -s user
+claude mcp add -s user liggghts -- \
+  /absolute/path/to/liggghts-mcp/.venv/bin/python \
+  /absolute/path/to/liggghts-mcp/server.py
+# then start a fresh `claude` session — existing sessions hold the old tool list
+```
+
+### LIGGGHTS_BIN must be set in the MCP startup environment
+
+`LIGGGHTS_BIN` is read at server startup. Setting it only in your interactive shell does **not** propagate to the MCP child process — Claude Code launches the server from its own environment. Either:
+
+- Install LIGGGHTS at the default path (`/usr/local/bin/liggghts`), or
+- Pass the env var when registering the server:
+  ```bash
+  claude mcp add -s user liggghts \
+    --env LIGGGHTS_BIN=/opt/liggghts/bin/liggghts \
+    -- /absolute/path/to/liggghts-mcp/.venv/bin/python \
+       /absolute/path/to/liggghts-mcp/server.py
+  ```
+
+If a run fails to launch, call `validate_liggghts_bin()` first — it reports the resolved path, executability, version line, and whether `mesh/surface/stress` is available.
+
 ### Usage examples
 
 In a Claude Code session, just say:
@@ -115,6 +143,7 @@ MIT. LIGGGHTS itself is GPL-2; this wrapper does not link against LIGGGHTS code,
 | `start_from_file(input_path, num_procs, name)` | 从已有 `.in` 文件启动 |
 | `start_from_dir(case_dir, deck_relpath, name, num_procs, link_mode)` | 把整个 case 目录（STL、.lammpstrj、.json 等）快照到 run dir 再跑 deck |
 | `run_plate_case(case_dir, pinn_root, name, postprocess)` | 一键跑完 plate-reference 流水线（`run_one_case.sh` settlement → plate_z0 重算 → intrusion，可选 postprocess） |
+| `validate_liggghts_bin()` | 探测 `LIGGGHTS_BIN`：是否存在 / 可执行 / 版本行 / 有没有 `mesh/surface/stress` 能力 — 仿真起不来时先调它 |
 | `check_status(run_id)` | running / finished + 退出码 + 最后一行日志（通过 `status.json` 跨 MCP 重启保留） |
 | `read_log(run_id, tail=200)` | 看 `log.run` 末尾 |
 | `list_outputs(run_id, patterns)` | 列出 `*.dump`、`*.lammpstrj`、`*.csv`、`*.json`、`*.log`、`log.*`、`screen.*`、`*.vtk`、`*.vtp`、`*.restart`、`post/*`（可自定义模式） |
@@ -162,6 +191,33 @@ claude mcp list
 ```
 
 新开一个 Claude Code 会话，7 个工具就可用了。
+
+### 升级后必须重启 MCP
+
+`git pull`（或修改代码）之后，Claude Code 仍持有旧的 MCP server 实例，新工具不会出现。重新加载步骤：
+
+```bash
+claude mcp remove liggghts -s user
+claude mcp add -s user liggghts -- \
+  /绝对路径/liggghts-mcp/.venv/bin/python \
+  /绝对路径/liggghts-mcp/server.py
+# 然后必须新开一个 claude 会话；已有会话仍持有旧的工具列表
+```
+
+### `LIGGGHTS_BIN` 要写到 MCP 启动环境里
+
+`LIGGGHTS_BIN` 是在 server 启动时读取的。光在你交互 shell 里 `export` 不会传给 MCP 子进程 —— Claude Code 用它自己的环境启动 server。要么:
+
+- 把 LIGGGHTS 装到默认路径（`/usr/local/bin/liggghts`），要么
+- 注册时把环境变量传进去:
+  ```bash
+  claude mcp add -s user liggghts \
+    --env LIGGGHTS_BIN=/opt/liggghts/bin/liggghts \
+    -- /绝对路径/liggghts-mcp/.venv/bin/python \
+       /绝对路径/liggghts-mcp/server.py
+  ```
+
+仿真起不来时先调一次 `validate_liggghts_bin()` —— 它会返回真正解析到的路径、可执行性、版本行、以及 `mesh/surface/stress` 是否可用。
 
 ### 使用示例
 

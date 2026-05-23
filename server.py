@@ -167,6 +167,64 @@ def _launch(
 
 
 @mcp.tool()
+def validate_liggghts_bin() -> dict:
+    """Probe the configured LIGGGHTS binary and report whether it can run.
+
+    Returns a dict with:
+      liggghts_bin:              path the server will invoke
+      exists:                    file is present
+      executable:                file is executable by current user
+      version_line:              first non-empty line of `liggghts -help` (or stderr)
+      mesh_surface_stress_probe: True if the binary's help text mentions
+                                 mesh/surface/stress (i.e. has the fixes the
+                                 plate workflow needs); None if probe failed
+      error:                     short error string when something fails
+    """
+    info: dict = {
+        "liggghts_bin": LIGGGHTS_BIN,
+        "exists": False,
+        "executable": False,
+        "version_line": None,
+        "mesh_surface_stress_probe": None,
+    }
+    p = Path(LIGGGHTS_BIN)
+    info["exists"] = p.is_file()
+    if not info["exists"]:
+        info["error"] = f"binary not found at {LIGGGHTS_BIN}"
+        return info
+    info["executable"] = os.access(p, os.X_OK)
+    if not info["executable"]:
+        info["error"] = f"binary not executable: {LIGGGHTS_BIN}"
+        return info
+    try:
+        proc = subprocess.run(
+            [LIGGGHTS_BIN, "-help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_child_env(),
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        info["error"] = "liggghts -help timed out after 10s"
+        return info
+    except OSError as e:
+        info["error"] = f"failed to spawn liggghts: {e}"
+        return info
+    blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    for line in blob.splitlines():
+        s = line.strip()
+        if s:
+            info["version_line"] = s
+            break
+    low = blob.lower()
+    info["mesh_surface_stress_probe"] = (
+        "mesh/surface/stress" in low or "mesh/surface" in low
+    )
+    return info
+
+
+@mcp.tool()
 def start_simulation(
     input_script: str,
     num_procs: int = 1,
