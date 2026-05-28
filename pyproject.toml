@@ -1,6 +1,6 @@
 [project]
 name = "liggghts-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP server wrapping LIGGGHTS DEM simulation — let LLM agents drive granular-flow simulations"
 readme = "README.md"
 requires-python = ">=3.10"

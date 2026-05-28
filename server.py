@@ -19,7 +19,7 @@ from pathlib import Path
 
 mcp = FastMCP("liggghts")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 LIGGGHTS_BIN = os.environ.get("LIGGGHTS_BIN", "/usr/local/bin/liggghts")
 RUNS = Path(os.environ.get("LIGGGHTS_RUNS", Path.home() / "liggghts_runs"))
@@ -1170,12 +1170,67 @@ def run_tilt_geometry_gates(
             raise RuntimeError(f"geometry gate dir exists at {wd}; pass overwrite=True")
         shutil.rmtree(wd)
     wd.mkdir(parents=True)
+    tilted_gen = pinn / "scripts" / "generate_liggghts_plate_tilted_geometry_unit_tests.py"
+    tilted_post = pinn / "scripts" / "postprocess_liggghts_plate_tilted_geometry_unit_tests.py"
     gen = pinn / "scripts" / "generate_liggghts_plate_geometry_unit_tests.py"
     post = pinn / "scripts" / "postprocess_liggghts_plate_geometry_unit_tests.py"
     gate_rows = []
     commands = []
     rc = 0
-    if gen.is_file() and post.is_file():
+    summary_rows = []
+    if tilted_gen.is_file() and tilted_post.is_file():
+        code = f"""
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("tilted_gate", {str(tilted_gen)!r})
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+mod.TILT_DEGREES = tuple({[float(t) for t in tilts_deg]!r})
+liggghts = Path({LIGGGHTS_BIN!r})
+mod.generate(liggghts)
+mod.run_tests(liggghts)
+"""
+        for cmd in (
+            [sys.executable, "-c", code],
+            [sys.executable, str(tilted_post)],
+        ):
+            proc = subprocess.run(
+                cmd,
+                cwd=str(pinn),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                env=_child_env({"LIGGGHTS_BIN": LIGGGHTS_BIN, "PINN_ROOT": str(pinn)}),
+                stdin=subprocess.DEVNULL,
+            )
+            cmd_text = shlex.join(cmd[:2]) + (" <tilted-gate-snippet>" if cmd[1] == "-c" else "")
+            commands.append({"cmd": cmd_text, "exit_code": proc.returncode, "output_tail": proc.stdout[-2048:]})
+            if proc.returncode != 0:
+                rc = proc.returncode
+                break
+        summary_csv = pinn / "outputs" / "plate_reference" / "liggghts_plate_tilted_geometry_unit_tests_summary.csv"
+        summary_rows = _read_manifest(summary_csv) if summary_csv.exists() else []
+        for tilt in tilts_deg:
+            rows_for_tilt = [
+                r for r in summary_rows
+                if abs(float(r.get("tilt_deg") or "nan") - float(tilt)) < 1.0e-9
+            ]
+            passed = rc == 0 and bool(rows_for_tilt) and all(
+                str(r.get("pass_geometry_check", "")).lower() == "true"
+                for r in rows_for_tilt
+            )
+            gate_rows.append({
+                "tilt_deg": tilt,
+                "status": "passed" if passed else "failed",
+                "passed": passed,
+                "supported_by_local_gate": bool(rows_for_tilt),
+                "tested_contact_count": len(rows_for_tilt),
+                "reason": "tilted single-face geometry gate passed" if passed else "tilted geometry gate failed or missing rows",
+            })
+    elif gen.is_file() and post.is_file():
         for cmd in (
             [sys.executable, str(gen), "--liggghts", LIGGGHTS_BIN, "--run"],
             [sys.executable, str(post)],
@@ -1194,20 +1249,28 @@ def run_tilt_geometry_gates(
             if proc.returncode != 0:
                 rc = proc.returncode
                 break
+        base_gate_passed = rc == 0
+        for tilt in tilts_deg:
+            supported = float(tilt) == 0.0
+            passed = base_gate_passed and supported
+            gate_rows.append({
+                "tilt_deg": tilt,
+                "status": "passed" if passed else "failed",
+                "passed": passed,
+                "supported_by_local_gate": supported,
+                "reason": "single-face zero-tilt geometry gate passed" if passed else "true per-tilt gate is not available in this PINN checkout",
+            })
     else:
         rc = 2
         commands.append({"error": "geometry unit-test scripts missing"})
-    base_gate_passed = rc == 0
-    for tilt in tilts_deg:
-        supported = float(tilt) == 0.0
-        passed = base_gate_passed and supported
-        gate_rows.append({
-            "tilt_deg": tilt,
-            "status": "passed" if passed else "failed",
-            "passed": passed,
-            "supported_by_local_gate": supported,
-            "reason": "single-face zero-tilt geometry gate passed" if passed else "true per-tilt gate is not available in this PINN checkout",
-        })
+        for tilt in tilts_deg:
+            gate_rows.append({
+                "tilt_deg": tilt,
+                "status": "failed",
+                "passed": False,
+                "supported_by_local_gate": False,
+                "reason": "geometry unit-test scripts missing",
+            })
     failed = [r["tilt_deg"] for r in gate_rows if not r["passed"]]
     result = {
         "gate_id": gate_id,
