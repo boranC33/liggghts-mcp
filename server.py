@@ -1,5 +1,6 @@
 """LIGGGHTS MCP server — start runs, poll status, read logs, list outputs."""
 from mcp.server.fastmcp import FastMCP
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import hashlib
 import json
@@ -16,10 +17,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 mcp = FastMCP("liggghts")
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 LIGGGHTS_BIN = os.environ.get("LIGGGHTS_BIN", "/usr/local/bin/liggghts")
 RUNS = Path(os.environ.get("LIGGGHTS_RUNS", Path.home() / "liggghts_runs"))
@@ -38,6 +40,54 @@ def _child_env(extra: dict | None = None) -> dict:
     if extra:
         env.update(extra)
     return env
+
+
+def _validate_rank_count(value: int, name: str) -> None:
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1")
+
+
+def _mpi_prefix(ranks: int, mpirun: str = "mpirun") -> list[str]:
+    _validate_rank_count(ranks, "mpi ranks")
+    if ranks == 1:
+        return []
+    launcher = shlex.split(mpirun.strip()) if mpirun.strip() else ["mpirun"]
+    return launcher + ["-np", str(ranks)]
+
+
+def _mpi_launcher_string(ranks: int, mpirun: str = "mpirun") -> str:
+    prefix = _mpi_prefix(ranks, mpirun)
+    return shlex.join(prefix) if prefix else ""
+
+
+def _liggghts_cmd(args: list[str], mpi_ranks: int = 1, mpirun: str = "mpirun") -> list[str]:
+    return _mpi_prefix(mpi_ranks, mpirun) + [LIGGGHTS_BIN] + args
+
+
+def _plate_env(pinn: Path, mpi_ranks: int = 1, mpirun: str = "mpirun") -> dict:
+    env = {"LIGGGHTS_BIN": LIGGGHTS_BIN, "PINN_ROOT": str(pinn)}
+    launcher = _mpi_launcher_string(mpi_ranks, mpirun)
+    if launcher:
+        env["LIGGGHTS_LAUNCHER"] = launcher
+    return env
+
+
+def _mpi_status_fields(
+    mpi_ranks: int = 1,
+    mpirun: str = "mpirun",
+    *,
+    workers: int | None = None,
+) -> dict:
+    launcher = _mpi_launcher_string(mpi_ranks, mpirun)
+    fields = {
+        "mpi_used": mpi_ranks > 1,
+        "mpi_ranks_per_case": mpi_ranks,
+        "mpi_launcher": launcher,
+        "mpirun": mpirun,
+    }
+    if workers is not None:
+        fields["total_requested_mpi_ranks"] = workers * mpi_ranks
+    return fields
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -74,7 +124,7 @@ _BATCH_FIELDS = [
     "case_id", "status", "exit_code", "settlement_completed",
     "intrusion_completed", "liggghts_error", "dangerous_builds",
     "force_csv_exists", "contact_count_csv_exists", "started_at", "finished_at",
-    "case_dir", "run_id",
+    "case_dir", "run_id", "case_log",
 ]
 
 
@@ -448,6 +498,8 @@ run             0
 def validate_liggghts_bin(
     run_parse_probe: bool = False,
     run_runtime_probe: bool = False,
+    mpi_ranks: int = 1,
+    mpirun: str = "mpirun",
 ) -> dict:
     """Probe the configured LIGGGHTS binary and report whether it can run.
 
@@ -466,6 +518,10 @@ def validate_liggghts_bin(
                                  v0.2.1 callers; will be removed in a future
                                  release).
       error:                     short error string when something fails
+      mpi_used:                  True when the probes were launched through
+                                 `mpirun -np mpi_ranks`
+      mpi_ranks_per_case:        rank count used for the probe commands
+      mpi_launcher:              launcher prefix, e.g. `mpirun -np 4`
 
     When `run_parse_probe=True`, additionally execute a minimal self-contained
     deck (a 2-triangle STL + a single `fix mesh/surface/stress ... stress on`
@@ -515,6 +571,7 @@ def validate_liggghts_bin(
       runtime_probe_error_tail: last ~2KB of probe stdout+stderr; empty
                                 string when probe succeeded
     """
+    _validate_rank_count(mpi_ranks, "mpi_ranks")
     info: dict = {
         "liggghts_bin": LIGGGHTS_BIN,
         "exists": False,
@@ -523,6 +580,7 @@ def validate_liggghts_bin(
         "mesh_surface": None,
         "mesh_surface_stress": None,
         "mesh_surface_stress_probe": None,
+        **_mpi_status_fields(mpi_ranks, mpirun),
     }
     p = Path(LIGGGHTS_BIN)
     info["exists"] = p.is_file()
@@ -535,7 +593,7 @@ def validate_liggghts_bin(
         return info
     try:
         proc = subprocess.run(
-            [LIGGGHTS_BIN, "-help"],
+            _liggghts_cmd(["-help"], mpi_ranks, mpirun),
             capture_output=True,
             text=True,
             timeout=10,
@@ -546,7 +604,7 @@ def validate_liggghts_bin(
         info["error"] = "liggghts -help timed out after 10s"
         return info
     except OSError as e:
-        info["error"] = f"failed to spawn liggghts: {e}"
+        info["error"] = f"failed to spawn liggghts command: {e}"
         return info
     blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
     for line in blob.splitlines():
@@ -566,7 +624,7 @@ def validate_liggghts_bin(
         (tmpdir / "probe.in").write_text(_PARSE_PROBE_DECK)
         try:
             pp = subprocess.run(
-                [LIGGGHTS_BIN, "-in", "probe.in"],
+                _liggghts_cmd(["-in", "probe.in"], mpi_ranks, mpirun),
                 capture_output=True,
                 text=True,
                 errors="replace",
@@ -591,7 +649,7 @@ def validate_liggghts_bin(
         except OSError as e:
             info["mesh_surface_stress_parse_probe"] = False
             info["parse_probe_exit_code"] = -1
-            info["parse_probe_error_tail"] = f"failed to spawn liggghts: {e}"
+            info["parse_probe_error_tail"] = f"failed to spawn liggghts command: {e}"
 
     if run_runtime_probe:
         tmpdir = Path(tempfile.mkdtemp(prefix="liggghts_runtime_probe_"))
@@ -600,7 +658,7 @@ def validate_liggghts_bin(
         (tmpdir / "probe.in").write_text(_RUNTIME_PROBE_DECK)
         try:
             rp = subprocess.run(
-                [LIGGGHTS_BIN, "-in", "probe.in"],
+                _liggghts_cmd(["-in", "probe.in"], mpi_ranks, mpirun),
                 capture_output=True,
                 text=True,
                 errors="replace",
@@ -625,7 +683,7 @@ def validate_liggghts_bin(
         except OSError as e:
             info["runtime_probe_ok"] = False
             info["runtime_probe_exit_code"] = -1
-            info["runtime_probe_error_tail"] = f"failed to spawn liggghts: {e}"
+            info["runtime_probe_error_tail"] = f"failed to spawn liggghts command: {e}"
     return info
 
 
@@ -635,6 +693,7 @@ def start_simulation(
     num_procs: int = 1,
     name: str | None = None,
     overwrite: bool = False,
+    mpirun: str = "mpirun",
 ) -> dict:
     """Start LIGGGHTS in the background and return a run_id immediately.
 
@@ -646,7 +705,10 @@ def start_simulation(
                   (only when the prior run is not currently running) before
                   starting. A still-running prior run is always rejected
                   regardless of this flag.
+    mpirun:       MPI launcher executable/options. The server appends
+                  `-np num_procs` when num_procs > 1.
     """
+    _validate_rank_count(num_procs, "num_procs")
     run_id = name or uuid.uuid4().hex[:8]
     wd = _run_dir(run_id)
     if wd.exists():
@@ -662,11 +724,18 @@ def start_simulation(
     wd.mkdir(parents=True)
     (wd / "input.in").write_text(input_script)
 
-    cmd = [LIGGGHTS_BIN, "-in", "input.in"]
-    if num_procs > 1:
-        cmd = ["mpirun", "-np", str(num_procs)] + cmd
+    cmd = _liggghts_cmd(["-in", "input.in"], num_procs, mpirun)
 
-    return _launch(wd, cmd, run_id=run_id, extra_status={"num_procs": num_procs})
+    return _launch(
+        wd,
+        cmd,
+        run_id=run_id,
+        extra_status={
+            "num_procs": num_procs,
+            "mpi_ranks": num_procs,
+            **_mpi_status_fields(num_procs, mpirun),
+        },
+    )
 
 
 @mcp.tool()
@@ -675,13 +744,14 @@ def start_from_file(
     num_procs: int = 1,
     name: str | None = None,
     overwrite: bool = False,
+    mpirun: str = "mpirun",
 ) -> dict:
     """Start a run from an existing input deck file. Copies it into the run dir."""
     src = Path(input_path).expanduser().resolve()
     if not src.is_file():
         raise FileNotFoundError(input_path)
     return start_simulation(
-        src.read_text(), num_procs=num_procs, name=name, overwrite=overwrite
+        src.read_text(), num_procs=num_procs, name=name, overwrite=overwrite, mpirun=mpirun
     )
 
 
@@ -693,6 +763,7 @@ def start_from_dir(
     num_procs: int = 1,
     link_mode: str = "copy",
     overwrite: bool = False,
+    mpirun: str = "mpirun",
 ) -> dict:
     """Snapshot a whole case directory into the run dir, then run LIGGGHTS on a deck inside it.
 
@@ -701,6 +772,8 @@ def start_from_dir(
     deck_relpath: path to the LIGGGHTS input deck *relative to case_dir*.
     name:         optional run_id; auto-generated if omitted.
     num_procs:    >1 launches via mpirun -np N.
+    mpirun:       MPI launcher executable/options. The server appends
+                  `-np num_procs` when num_procs > 1.
     link_mode:    "copy" (default, RECOMMENDED) makes a full isolated copy —
                   the run dir is independent of the source. Outputs land in
                   the run dir, source case_dir is untouched.
@@ -737,6 +810,7 @@ def start_from_dir(
         raise FileNotFoundError(f"deck not found: {src / deck_rel}")
     if link_mode not in ("copy", "symlink"):
         raise ValueError("link_mode must be 'copy' or 'symlink'")
+    _validate_rank_count(num_procs, "num_procs")
 
     run_id = name or uuid.uuid4().hex[:8]
     wd = _run_dir(run_id)
@@ -764,9 +838,7 @@ def start_from_dir(
                 link = wd / rel_root / fname
                 link.symlink_to(target.resolve())
 
-    cmd = [LIGGGHTS_BIN, "-in", str(deck_rel)]
-    if num_procs > 1:
-        cmd = ["mpirun", "-np", str(num_procs)] + cmd
+    cmd = _liggghts_cmd(["-in", str(deck_rel)], num_procs, mpirun)
 
     return _launch(
         wd,
@@ -778,6 +850,8 @@ def start_from_dir(
             "deck_relpath": str(deck_rel),
             "link_mode": link_mode,
             "num_procs": num_procs,
+            "mpi_ranks": num_procs,
+            **_mpi_status_fields(num_procs, mpirun),
         },
     )
 
@@ -789,6 +863,8 @@ def run_plate_case(
     name: str | None = None,
     postprocess: bool = False,
     overwrite: bool = False,
+    mpi_ranks: int = 1,
+    mpirun: str = "mpirun",
 ) -> dict:
     """Run the full plate-reference pipeline in-place on a case dir.
 
@@ -816,6 +892,10 @@ def run_plate_case(
     name:        optional run_id.
     postprocess: also run the sweep postprocessor (default False — only safe
                  when basename(case_dir) is in the sweep manifest).
+    mpi_ranks:   MPI ranks per case. When >1, sets LIGGGHTS_LAUNCHER to
+                 `{mpirun} -np {mpi_ranks}` for the project runner.
+    mpirun:      MPI launcher executable/options. The server appends
+                 `-np mpi_ranks` when mpi_ranks > 1.
     overwrite:   if False (default), refuse to start when a run dir for
                  `name` already exists. If True, clear the existing dir
                  (only when the prior run is not currently running) before
@@ -824,6 +904,7 @@ def run_plate_case(
                  run dir; outputs the runner writes into `case_dir` itself
                  are not touched.
     """
+    _validate_rank_count(mpi_ranks, "mpi_ranks")
     case = Path(case_dir).expanduser().resolve()
     if not case.is_dir():
         raise FileNotFoundError(f"case_dir not a directory: {case_dir}")
@@ -884,6 +965,7 @@ def run_plate_case(
         "case_dir_outputs": str(case),
         "pinn_root": str(pinn),
         "postprocess": postprocess,
+        **_mpi_status_fields(mpi_ranks, mpirun),
     }
     if postprocess:
         extra_status["summary_csv"] = str(summary_csv)
@@ -894,10 +976,7 @@ def run_plate_case(
         cmd,
         run_id=run_id,
         cwd=pinn,
-        env_extra={
-            "LIGGGHTS_BIN": LIGGGHTS_BIN,
-            "PINN_ROOT": str(pinn),
-        },
+        env_extra=_plate_env(pinn, mpi_ranks, mpirun),
         extra_status=extra_status,
     )
 
@@ -1089,12 +1168,17 @@ def validate_project_environment(
     require_serial_liggghts: bool = True,
     run_parse_probe: bool = True,
     run_runtime_probe: bool = True,
+    mpi_ranks: int = 1,
+    mpirun: str = "mpirun",
 ) -> dict:
     """Validate PINN project paths, LIGGGHTS binary, scripts, and safety metadata."""
+    _validate_rank_count(mpi_ranks, "mpi_ranks")
     pinn = _resolve_pinn(pinn_root)
     lig = validate_liggghts_bin(
         run_parse_probe=run_parse_probe,
         run_runtime_probe=run_runtime_probe,
+        mpi_ranks=mpi_ranks,
+        mpirun=mpirun,
     )
     missing = [rel for rel in _PROJECT_REQUIRED_PATHS if not (pinn / rel).exists()]
     env_path = pinn / "hpc" / "liggghts_plate_tier1" / "environment.sh"
@@ -1144,6 +1228,7 @@ def validate_project_environment(
         "run_root_writable": run_root_writable,
         "gpu_visible": gpu_visible,
         "gpu_used": False,
+        **_mpi_status_fields(mpi_ranks, mpirun),
         "ready": ready,
     }
 
@@ -1300,9 +1385,12 @@ def _run_plate_manifest_batch_sync(
     raw_dump_policy: str,
     overwrite: bool,
     resume: bool,
+    mpi_ranks: int = 1,
+    mpirun: str = "mpirun",
 ) -> dict:
     if workers < 1:
         raise ValueError("workers must be >= 1")
+    _validate_rank_count(mpi_ranks, "mpi_ranks")
     if raw_dump_policy != "do_not_package":
         raise ValueError("only raw_dump_policy='do_not_package' is supported")
     geometry_gate = _geometry_gate_ready(pinn)
@@ -1315,6 +1403,20 @@ def _run_plate_manifest_batch_sync(
     unsafe = [r.get("case_id", "") for r in rows if str(r.get("is_reference_quality", "")).lower() == "true" or str(r.get("is_training_data", "")).lower() == "true"]
     if unsafe:
         raise RuntimeError(f"manifest attempts reference/training promotion: {unsafe}")
+    runner = pinn / "hpc" / "liggghts_plate_tier1" / "run_one_case.sh"
+    generator = pinn / "scripts" / "generate_liggghts_plate_hpc_cases.py"
+    if not runner.is_file():
+        raise FileNotFoundError(f"runner not found: {runner}")
+    if not generator.is_file():
+        raise FileNotFoundError(f"generator not found: {generator}")
+    lig = validate_liggghts_bin(
+        run_parse_probe=False,
+        run_runtime_probe=False,
+        mpi_ranks=mpi_ranks,
+        mpirun=mpirun,
+    )
+    if not lig.get("exists") or not lig.get("executable") or lig.get("error"):
+        raise RuntimeError(f"LIGGGHTS binary preflight failed: {lig}")
     wd = _batch_dir(batch_id)
     if wd.exists() and overwrite and not resume:
         pid = _read_pid(wd)
@@ -1340,59 +1442,188 @@ def _run_plate_manifest_batch_sync(
         "mcp_server_version": __version__,
         "liggghts_bin": LIGGGHTS_BIN,
         "started_at": _now_iso(),
+        "status": "running",
+        **_mpi_status_fields(mpi_ranks, mpirun, workers=workers),
     }
     _write_json(wd / "batch_metadata.json", metadata)
+    _write_status(wd, metadata)
     old_rows = {r.get("case_id", ""): r for r in _read_case_status(wd)} if resume else {}
     skipped_completed_cases = 0
     resumed_cases = 0
-    case_status = []
+    case_order = [r.get("case_id", "").strip() for r in rows if r.get("case_id", "").strip()]
+    case_status_by_id: dict[str, dict] = {}
+    run_tasks: list[dict] = []
     log = wd / "log.run"
-    runner = pinn / "hpc" / "liggghts_plate_tier1" / "run_one_case.sh"
-    generator = pinn / "scripts" / "generate_liggghts_plate_hpc_cases.py"
+    case_log_dir = wd / "case_logs"
+    case_log_dir.mkdir(parents=True, exist_ok=True)
     cases_root = pinn / "hpc" / "liggghts_plate_tier1" / "generated_cases"
-    with log.open("a", encoding="utf-8") as lf:
-        for row in rows:
-            case_id = row.get("case_id", "").strip()
-            if not case_id:
-                continue
-            previous = old_rows.get(case_id)
-            if previous and previous.get("status") == "completed" and str(previous.get("exit_code")) == "0":
-                case_status.append({**previous, "status": "completed"})
-                skipped_completed_cases += 1
-                continue
-            if previous:
-                resumed_cases += 1
-            case_dir = cases_root / case_id
-            started = _now_iso()
-            lf.write(f"[mcp-batch] generate case_id={case_id}\n")
-            lf.flush()
+    batch_log_lock = Lock()
+
+    def ordered_case_status() -> list[dict]:
+        return [case_status_by_id[c] for c in case_order if c in case_status_by_id]
+
+    def append_batch_log(line: str) -> None:
+        with batch_log_lock:
+            with log.open("a", encoding="utf-8") as lf:
+                lf.write(line.rstrip() + "\n")
+
+    def persist_progress(status: str = "running") -> None:
+        current_rows = ordered_case_status()
+        summary = _batch_summary(current_rows)
+        progress = {
+            **metadata,
+            **summary,
+            "attempted_cases": len(current_rows),
+            "resumed_cases": resumed_cases,
+            "skipped_completed_cases": skipped_completed_cases,
+            "status": status,
+            "case_status_csv": str(wd / "case_status.csv"),
+            "status_json": str(wd / "status.json"),
+        }
+        _write_case_status(wd, current_rows)
+        _write_json(wd / "batch_metadata.json", progress)
+        _write_status(wd, progress)
+
+    def build_failed_row(
+        case_id: str,
+        case_dir: Path,
+        exit_code: int,
+        started: str,
+        case_log: Path,
+        error: str = "",
+    ) -> dict:
+        return {
+            "case_id": case_id,
+            "status": "failed",
+            "exit_code": exit_code,
+            "settlement_completed": "false",
+            "intrusion_completed": "false",
+            "liggghts_error": error,
+            "dangerous_builds": "",
+            "force_csv_exists": "false",
+            "contact_count_csv_exists": "false",
+            "started_at": started,
+            "finished_at": _now_iso(),
+            "case_dir": str(case_dir),
+            "run_id": f"{batch_id}:{case_id}",
+            "case_log": str(case_log),
+        }
+
+    append_batch_log(
+        f"[mcp-batch] start batch_id={batch_id} workers={workers} "
+        f"mpi_ranks_per_case={mpi_ranks} total_ranks={workers * mpi_ranks}"
+    )
+    for row in rows:
+        case_id = row.get("case_id", "").strip()
+        if not case_id:
+            continue
+        previous = old_rows.get(case_id)
+        if previous and previous.get("status") == "completed" and str(previous.get("exit_code")) == "0":
+            case_status_by_id[case_id] = {**previous, "status": "completed"}
+            skipped_completed_cases += 1
+            persist_progress()
+            continue
+        if previous:
+            resumed_cases += 1
+        case_dir = cases_root / case_id
+        case_log = case_log_dir / f"{case_id}.log"
+        started = _now_iso()
+        append_batch_log(f"[mcp-batch] generate case_id={case_id}")
+        with case_log.open("a", encoding="utf-8") as clf:
+            clf.write(f"[mcp-case] generate case_id={case_id}\n")
+            clf.flush()
             gen_proc = subprocess.run(
                 [sys.executable, str(generator), "--generate", "--case-id", case_id],
-                cwd=str(pinn), stdout=lf, stderr=subprocess.STDOUT,
+                cwd=str(pinn), stdout=clf, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=_child_env({"LIGGGHTS_BIN": LIGGGHTS_BIN, "PINN_ROOT": str(pinn)}),
+                env=_child_env(_plate_env(pinn, mpi_ranks, mpirun)),
             )
-            if gen_proc.returncode != 0:
-                case_status.append({"case_id": case_id, "status": "failed", "exit_code": gen_proc.returncode, "started_at": started, "finished_at": _now_iso(), "case_dir": str(case_dir)})
-                _write_case_status(wd, case_status)
-                break
-            lf.write(f"[mcp-batch] run_one_case case_id={case_id}\n")
-            lf.flush()
-            proc = subprocess.run(
-                ["bash", str(runner), str(case_dir)],
-                cwd=str(pinn), stdout=lf, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                env=_child_env({"LIGGGHTS_BIN": LIGGGHTS_BIN, "PINN_ROOT": str(pinn)}),
+        if gen_proc.returncode != 0:
+            append_batch_log(
+                f"[mcp-batch] generate failed case_id={case_id} exit_code={gen_proc.returncode}"
             )
+            case_status_by_id[case_id] = build_failed_row(
+                case_id, case_dir, gen_proc.returncode, started, case_log,
+                "case generation failed",
+            )
+            persist_progress()
+            continue
+        case_status_by_id[case_id] = {
+            "case_id": case_id,
+            "status": "pending",
+            "exit_code": "",
+            "started_at": started,
+            "finished_at": "",
+            "case_dir": str(case_dir),
+            "run_id": f"{batch_id}:{case_id}",
+            "case_log": str(case_log),
+        }
+        run_tasks.append({
+            "case_id": case_id,
+            "case_dir": case_dir,
+            "case_log": case_log,
+            "started": started,
+        })
+        persist_progress()
+
+    def run_case(task: dict) -> dict:
+        case_id = task["case_id"]
+        case_dir = task["case_dir"]
+        case_log = task["case_log"]
+        started = task["started"]
+        append_batch_log(f"[mcp-batch] run_one_case start case_id={case_id}")
+        try:
+            with case_log.open("a", encoding="utf-8") as clf:
+                clf.write(
+                    f"[mcp-case] run_one_case case_id={case_id} "
+                    f"mpi_launcher={_mpi_launcher_string(mpi_ranks, mpirun)!r}\n"
+                )
+                clf.flush()
+                proc = subprocess.run(
+                    ["bash", str(runner), str(case_dir)],
+                    cwd=str(pinn), stdout=clf, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    env=_child_env(_plate_env(pinn, mpi_ranks, mpirun)),
+                )
             status_row = _case_status_from_dir(case_id, case_dir, f"{batch_id}:{case_id}")
             status_row["exit_code"] = proc.returncode
-            status_row["status"] = "completed" if proc.returncode == 0 and status_row["status"] == "completed" else "failed"
-            status_row["started_at"] = started
-            status_row["finished_at"] = _now_iso()
-            case_status.append(status_row)
-            _write_case_status(wd, case_status)
-            if proc.returncode != 0:
-                break
+            status_row["status"] = (
+                "completed"
+                if proc.returncode == 0 and status_row["status"] == "completed"
+                else "failed"
+            )
+        except OSError as e:
+            status_row = build_failed_row(case_id, case_dir, 127, started, case_log, str(e))
+        status_row["started_at"] = started
+        status_row["finished_at"] = _now_iso()
+        status_row["case_log"] = str(case_log)
+        append_batch_log(
+            f"[mcp-batch] run_one_case done case_id={case_id} "
+            f"status={status_row['status']} exit_code={status_row['exit_code']}"
+        )
+        return status_row
+
+    if run_tasks:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(run_case, task): task["case_id"] for task in run_tasks}
+            for future in as_completed(futures):
+                case_id = futures[future]
+                try:
+                    case_status_by_id[case_id] = future.result()
+                except Exception as e:
+                    task = next(t for t in run_tasks if t["case_id"] == case_id)
+                    case_status_by_id[case_id] = build_failed_row(
+                        case_id,
+                        task["case_dir"],
+                        1,
+                        task["started"],
+                        task["case_log"],
+                        f"worker exception: {e}",
+                    )
+                    append_batch_log(f"[mcp-batch] worker exception case_id={case_id}: {e}")
+                persist_progress()
+
+    case_status = ordered_case_status()
     summary = _batch_summary(case_status)
     failed = summary["failed_cases"] > 0
     metadata.update(summary)
@@ -1404,9 +1635,14 @@ def _run_plate_manifest_batch_sync(
     metadata["exit_code"] = 1 if failed else 0
     metadata["case_status_csv"] = str(wd / "case_status.csv")
     metadata["status_json"] = str(wd / "status.json")
+    metadata.update(_mpi_status_fields(mpi_ranks, mpirun, workers=workers))
     _write_json(wd / "batch_metadata.json", metadata)
     _write_status(wd, metadata)
     (wd / "exit_code").write_text(str(metadata["exit_code"]))
+    append_batch_log(
+        f"[mcp-batch] finished batch_id={batch_id} status={metadata['status']} "
+        f"completed={summary['completed_cases']} failed={summary['failed_cases']}"
+    )
     return metadata
 
 
@@ -1420,8 +1656,16 @@ def run_plate_manifest_batch(
     raw_dump_policy: str = "do_not_package",
     overwrite: bool = False,
     resume: bool = False,
+    mpi_ranks: int = 1,
+    mpirun: str = "mpirun",
 ) -> dict:
-    """Generate and run LIGGGHTS plate cases from a manifest with persistent batch status."""
+    """Generate and run LIGGGHTS plate cases from a manifest with persistent batch status.
+
+    `workers` controls how many cases run concurrently. `mpi_ranks` controls
+    how many MPI ranks each case receives via LIGGGHTS_LAUNCHER. Keep
+    workers * mpi_ranks within the host's useful CPU core count unless you
+    intentionally want oversubscription.
+    """
     pinn = _resolve_pinn(pinn_root)
     manifest = _resolve_manifest(pinn, manifest_path)
     wd = _batch_dir(batch_id)
@@ -1432,7 +1676,7 @@ def run_plate_manifest_batch(
         raise RuntimeError(f"batch_id {batch_id} already exists at {wd}; pass overwrite=True or resume=True")
     return _run_plate_manifest_batch_sync(
         pinn, manifest, batch_id, workers, require_geometry_gate,
-        raw_dump_policy, overwrite, resume,
+        raw_dump_policy, overwrite, resume, mpi_ranks, mpirun,
     )
 
 
@@ -1468,6 +1712,8 @@ def resume_plate_manifest_batch(
     batch_id: str,
     failed_only: bool = True,
     workers: int | None = None,
+    mpi_ranks: int | None = None,
+    mpirun: str | None = None,
 ) -> dict:
     """Resume a manifest batch without rerunning completed cases."""
     wd = _batch_dir(batch_id)
@@ -1483,6 +1729,8 @@ def resume_plate_manifest_batch(
         metadata.get("raw_dump_policy", "do_not_package"),
         overwrite=False,
         resume=True,
+        mpi_ranks=mpi_ranks or int(metadata.get("mpi_ranks_per_case") or 1),
+        mpirun=mpirun or str(metadata.get("mpirun") or "mpirun"),
     )
 
 
