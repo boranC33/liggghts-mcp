@@ -1,5 +1,7 @@
 """LIGGGHTS MCP server — start runs, poll status, read logs, list outputs."""
 from mcp.server.fastmcp import FastMCP
+import csv
+import hashlib
 import json
 import os
 import re
@@ -7,6 +9,8 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -14,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 mcp = FastMCP("liggghts")
+
+__version__ = "0.3.0"
 
 LIGGGHTS_BIN = os.environ.get("LIGGGHTS_BIN", "/usr/local/bin/liggghts")
 RUNS = Path(os.environ.get("LIGGGHTS_RUNS", Path.home() / "liggghts_runs"))
@@ -44,6 +50,171 @@ def _run_dir(run_id: str) -> Path:
     if RUNS.resolve() not in wd.parents and wd != RUNS.resolve():
         raise ValueError("run_id escapes runs root")
     return wd
+
+
+
+_PROJECT_REQUIRED_PATHS = (
+    "scripts/prepare_intrusion_plate_z0.py",
+    "scripts/validate_liggghts_plate_hpc_setup.py",
+    "scripts/generate_liggghts_plate_hpc_manifest.py",
+    "scripts/generate_liggghts_plate_hpc_cases.py",
+    "scripts/postprocess_liggghts_plate_hpc_sweep.py",
+    "hpc/liggghts_plate_tier1/run_one_case.sh",
+    "hpc/liggghts_plate_tier1/environment.sh",
+)
+
+_FORBIDDEN_RAW_DUMPS = {
+    "contact_local.dump",
+    "particles.lammpstrj",
+    "settlement_particles.lammpstrj",
+    "settled_particles.lammpstrj",
+}
+
+_BATCH_FIELDS = [
+    "case_id", "status", "exit_code", "settlement_completed",
+    "intrusion_completed", "liggghts_error", "dangerous_builds",
+    "force_csv_exists", "contact_count_csv_exists", "started_at", "finished_at",
+    "case_dir", "run_id",
+]
+
+
+def _batch_dir(batch_id: str) -> Path:
+    return _run_dir(batch_id)
+
+
+def _read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2))
+
+
+def _resolve_pinn(pinn_root: str) -> Path:
+    pinn = Path(pinn_root).expanduser().resolve()
+    if not pinn.is_dir():
+        raise FileNotFoundError(f"pinn_root not a directory: {pinn_root}")
+    return pinn
+
+
+def _resolve_manifest(pinn: Path, manifest_path: str) -> Path:
+    path = Path(manifest_path).expanduser()
+    if not path.is_absolute():
+        path = pinn / path
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"manifest not found: {path}")
+    return path
+
+
+def _read_manifest(path: Path) -> list[dict]:
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_case_status(batch_dir: Path, rows: list[dict]) -> None:
+    with (batch_dir / "case_status.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_BATCH_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in _BATCH_FIELDS})
+
+
+def _read_case_status(batch_dir: Path) -> list[dict]:
+    path = batch_dir / "case_status.csv"
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _log_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def _dangerous_builds(case_dir: Path) -> int:
+    total = 0
+    for name in ("settle_screen.log", "screen.log", "log.liggghts"):
+        for line in _log_text(case_dir / name).splitlines():
+            if "Dangerous builds" not in line:
+                continue
+            try:
+                total += int(line.split("=", 1)[1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+    return total
+
+
+def _liggghts_errors(case_dir: Path) -> str:
+    out = []
+    for name in ("settle_screen.log", "screen.log", "log.liggghts"):
+        for line in _log_text(case_dir / name).splitlines():
+            if "ERROR" in line:
+                out.append(f"{name}: {line.strip()}")
+    return "; ".join(out)
+
+
+def _case_completed(case_dir: Path, *names: str) -> bool:
+    return any("Loop time" in _log_text(case_dir / name) for name in names)
+
+
+def _case_status_from_dir(case_id: str, case_dir: Path, run_id: str = "") -> dict:
+    errors = _liggghts_errors(case_dir)
+    return {
+        "case_id": case_id,
+        "status": "completed" if _case_completed(case_dir, "settle_screen.log") and _case_completed(case_dir, "screen.log", "log.liggghts") and not errors else "failed",
+        "exit_code": 0 if not errors else 1,
+        "settlement_completed": str(_case_completed(case_dir, "settle_screen.log")).lower(),
+        "intrusion_completed": str(_case_completed(case_dir, "screen.log", "log.liggghts")).lower(),
+        "liggghts_error": errors,
+        "dangerous_builds": _dangerous_builds(case_dir),
+        "force_csv_exists": str((case_dir / "plate_force_raw.csv").exists()).lower(),
+        "contact_count_csv_exists": str((case_dir / "contact_local.dump").exists()).lower(),
+        "started_at": "",
+        "finished_at": _now_iso(),
+        "case_dir": str(case_dir),
+        "run_id": run_id,
+    }
+
+
+def _batch_summary(rows: list[dict]) -> dict:
+    completed = [r for r in rows if r.get("status") == "completed"]
+    failed = [r for r in rows if r.get("status") == "failed"]
+    running = [r for r in rows if r.get("status") == "running"]
+    pending = [r for r in rows if r.get("status") in ("pending", "skipped")]
+    return {
+        "completed_cases": len(completed),
+        "failed_cases": len(failed),
+        "running_cases": len(running),
+        "pending_cases": len(pending),
+    }
+
+
+def _geometry_gate_ready(pinn: Path) -> dict:
+    for gate_dir in sorted(RUNS.glob("geometry_gates_*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        status = _read_json(gate_dir / "geometry_gate_status.json")
+        if status.get("pinn_root") == str(pinn):
+            return {
+                "gate_id": status.get("gate_id", gate_dir.name),
+                "ready_for_dem": bool(status.get("ready_for_dem")),
+                "passed_count": status.get("passed_count", 0),
+                "failed_count": status.get("failed_count", 0),
+                "failed_tilts": status.get("failed_tilts", []),
+                "status_path": str(gate_dir / "geometry_gate_status.json"),
+            }
+    return {
+        "gate_id": "",
+        "ready_for_dem": False,
+        "passed_count": 0,
+        "failed_count": None,
+        "failed_tilts": [],
+        "status_path": "",
+    }
 
 
 def _read_pid(wd: Path) -> int | None:
@@ -909,6 +1080,469 @@ def stop_simulation(run_id: str) -> dict:
         "status": "terminated",
         "pid": pid,
         "termination_signal": sig_used,
+    }
+
+
+@mcp.tool()
+def validate_project_environment(
+    pinn_root: str,
+    require_serial_liggghts: bool = True,
+    run_parse_probe: bool = True,
+    run_runtime_probe: bool = True,
+) -> dict:
+    """Validate PINN project paths, LIGGGHTS binary, scripts, and safety metadata."""
+    pinn = _resolve_pinn(pinn_root)
+    lig = validate_liggghts_bin(
+        run_parse_probe=run_parse_probe,
+        run_runtime_probe=run_runtime_probe,
+    )
+    missing = [rel for rel in _PROJECT_REQUIRED_PATHS if not (pinn / rel).exists()]
+    env_path = pinn / "hpc" / "liggghts_plate_tier1" / "environment.sh"
+    write_probe = RUNS / f".write_probe_{uuid.uuid4().hex[:8]}"
+    run_root_writable = False
+    try:
+        write_probe.write_text("ok")
+        write_probe.unlink()
+        run_root_writable = True
+    except OSError:
+        run_root_writable = False
+    gpu_visible = bool(os.environ.get("CUDA_VISIBLE_DEVICES"))
+    version_line = str(lig.get("version_line") or "")
+    vlow = version_line.lower()
+    bin_low = LIGGGHTS_BIN.lower()
+    mpi_markers = ("mpi build", "mpi version", "with mpi", "openmpi", "mpich", "intel mpi")
+    serial_liggghts = (
+        not any(m in vlow for m in mpi_markers)
+        and "mpirun" not in bin_low
+        and "/mpi/" not in bin_low
+    )
+    probe_ok = True
+    if run_parse_probe:
+        probe_ok = probe_ok and bool(lig.get("mesh_surface_stress_parse_probe"))
+    if run_runtime_probe:
+        probe_ok = probe_ok and bool(lig.get("runtime_probe_ok"))
+    ready = (
+        not missing
+        and bool(lig.get("exists"))
+        and bool(lig.get("executable"))
+        and probe_ok
+        and run_root_writable
+        and (serial_liggghts or not require_serial_liggghts)
+    )
+    return {
+        "pinn_root": str(pinn),
+        "python_version": sys.version.split()[0],
+        "liggghts_bin": LIGGGHTS_BIN,
+        "liggghts_validation": lig,
+        "serial_liggghts": serial_liggghts,
+        "require_serial_liggghts": require_serial_liggghts,
+        "required_scripts": list(_PROJECT_REQUIRED_PATHS),
+        "missing_scripts": missing,
+        "environment_sh": str(env_path),
+        "environment_sh_exists": env_path.exists(),
+        "run_root": str(RUNS),
+        "run_root_writable": run_root_writable,
+        "gpu_visible": gpu_visible,
+        "gpu_used": False,
+        "ready": ready,
+    }
+
+
+@mcp.tool()
+def run_tilt_geometry_gates(
+    pinn_root: str,
+    tilts_deg: list[float],
+    workers: int = 1,
+    overwrite: bool = False,
+) -> dict:
+    """Run available single-face geometry gates and block broad tilt batches when true per-tilt gates are unavailable."""
+    pinn = _resolve_pinn(pinn_root)
+    gate_id = "geometry_gates_" + uuid.uuid5(uuid.NAMESPACE_URL, str(pinn)).hex[:12]
+    wd = _batch_dir(gate_id)
+    if wd.exists():
+        pid = _read_pid(wd)
+        if pid and _alive(pid):
+            raise RuntimeError(f"geometry gate {gate_id} is already running")
+        if not overwrite:
+            existing = _read_json(wd / "geometry_gate_status.json")
+            if existing:
+                return existing
+            raise RuntimeError(f"geometry gate dir exists at {wd}; pass overwrite=True")
+        shutil.rmtree(wd)
+    wd.mkdir(parents=True)
+    gen = pinn / "scripts" / "generate_liggghts_plate_geometry_unit_tests.py"
+    post = pinn / "scripts" / "postprocess_liggghts_plate_geometry_unit_tests.py"
+    gate_rows = []
+    commands = []
+    rc = 0
+    if gen.is_file() and post.is_file():
+        for cmd in (
+            [sys.executable, str(gen), "--liggghts", LIGGGHTS_BIN, "--run"],
+            [sys.executable, str(post)],
+        ):
+            proc = subprocess.run(
+                cmd,
+                cwd=str(pinn),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                env=_child_env({"LIGGGHTS_BIN": LIGGGHTS_BIN, "PINN_ROOT": str(pinn)}),
+                stdin=subprocess.DEVNULL,
+            )
+            commands.append({"cmd": shlex.join(cmd), "exit_code": proc.returncode, "output_tail": proc.stdout[-2048:]})
+            if proc.returncode != 0:
+                rc = proc.returncode
+                break
+    else:
+        rc = 2
+        commands.append({"error": "geometry unit-test scripts missing"})
+    base_gate_passed = rc == 0
+    for tilt in tilts_deg:
+        supported = float(tilt) == 0.0
+        passed = base_gate_passed and supported
+        gate_rows.append({
+            "tilt_deg": tilt,
+            "status": "passed" if passed else "failed",
+            "passed": passed,
+            "supported_by_local_gate": supported,
+            "reason": "single-face zero-tilt geometry gate passed" if passed else "true per-tilt gate is not available in this PINN checkout",
+        })
+    failed = [r["tilt_deg"] for r in gate_rows if not r["passed"]]
+    result = {
+        "gate_id": gate_id,
+        "pinn_root": str(pinn),
+        "workers": workers,
+        "gate_rows": gate_rows,
+        "passed_count": len(gate_rows) - len(failed),
+        "failed_count": len(failed),
+        "failed_tilts": failed,
+        "ready_for_dem": len(failed) == 0,
+        "commands": commands,
+        "gpu_used": False,
+        "is_reference_quality": False,
+        "is_training_data": False,
+    }
+    _write_json(wd / "geometry_gate_status.json", result)
+    _write_json(wd / "batch_metadata.json", result)
+    return result
+
+
+def _run_plate_manifest_batch_sync(
+    pinn: Path,
+    manifest: Path,
+    batch_id: str,
+    workers: int,
+    require_geometry_gate: bool,
+    raw_dump_policy: str,
+    overwrite: bool,
+    resume: bool,
+) -> dict:
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+    if raw_dump_policy != "do_not_package":
+        raise ValueError("only raw_dump_policy='do_not_package' is supported")
+    geometry_gate = _geometry_gate_ready(pinn)
+    if require_geometry_gate and not geometry_gate["ready_for_dem"]:
+        raise RuntimeError(
+            "required geometry gate is not ready for DEM; "
+            f"gate_id={geometry_gate['gate_id']!r} failed_tilts={geometry_gate['failed_tilts']}"
+        )
+    rows = _read_manifest(manifest)
+    unsafe = [r.get("case_id", "") for r in rows if str(r.get("is_reference_quality", "")).lower() == "true" or str(r.get("is_training_data", "")).lower() == "true"]
+    if unsafe:
+        raise RuntimeError(f"manifest attempts reference/training promotion: {unsafe}")
+    wd = _batch_dir(batch_id)
+    if wd.exists() and overwrite and not resume:
+        pid = _read_pid(wd)
+        if pid and _alive(pid):
+            raise RuntimeError(f"batch_id {batch_id} is already running")
+        shutil.rmtree(wd)
+    wd.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "batch_id": batch_id,
+        "kind": "plate_manifest_batch",
+        "pinn_root": str(pinn),
+        "manifest_path": str(manifest),
+        "manifest_rows": len(rows),
+        "workers": workers,
+        "require_geometry_gate": require_geometry_gate,
+        "raw_dump_policy": raw_dump_policy,
+        "geometry_gate": geometry_gate,
+        "gpu_used": False,
+        "raw_dumps_packaged": False,
+        "is_reference_quality": False,
+        "is_training_data": False,
+        "mcp_used": True,
+        "mcp_server_version": __version__,
+        "liggghts_bin": LIGGGHTS_BIN,
+        "started_at": _now_iso(),
+    }
+    _write_json(wd / "batch_metadata.json", metadata)
+    old_rows = {r.get("case_id", ""): r for r in _read_case_status(wd)} if resume else {}
+    skipped_completed_cases = 0
+    resumed_cases = 0
+    case_status = []
+    log = wd / "log.run"
+    runner = pinn / "hpc" / "liggghts_plate_tier1" / "run_one_case.sh"
+    generator = pinn / "scripts" / "generate_liggghts_plate_hpc_cases.py"
+    cases_root = pinn / "hpc" / "liggghts_plate_tier1" / "generated_cases"
+    with log.open("a", encoding="utf-8") as lf:
+        for row in rows:
+            case_id = row.get("case_id", "").strip()
+            if not case_id:
+                continue
+            previous = old_rows.get(case_id)
+            if previous and previous.get("status") == "completed" and str(previous.get("exit_code")) == "0":
+                case_status.append({**previous, "status": "completed"})
+                skipped_completed_cases += 1
+                continue
+            if previous:
+                resumed_cases += 1
+            case_dir = cases_root / case_id
+            started = _now_iso()
+            lf.write(f"[mcp-batch] generate case_id={case_id}\n")
+            lf.flush()
+            gen_proc = subprocess.run(
+                [sys.executable, str(generator), "--generate", "--case-id", case_id],
+                cwd=str(pinn), stdout=lf, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=_child_env({"LIGGGHTS_BIN": LIGGGHTS_BIN, "PINN_ROOT": str(pinn)}),
+            )
+            if gen_proc.returncode != 0:
+                case_status.append({"case_id": case_id, "status": "failed", "exit_code": gen_proc.returncode, "started_at": started, "finished_at": _now_iso(), "case_dir": str(case_dir)})
+                _write_case_status(wd, case_status)
+                break
+            lf.write(f"[mcp-batch] run_one_case case_id={case_id}\n")
+            lf.flush()
+            proc = subprocess.run(
+                ["bash", str(runner), str(case_dir)],
+                cwd=str(pinn), stdout=lf, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=_child_env({"LIGGGHTS_BIN": LIGGGHTS_BIN, "PINN_ROOT": str(pinn)}),
+            )
+            status_row = _case_status_from_dir(case_id, case_dir, f"{batch_id}:{case_id}")
+            status_row["exit_code"] = proc.returncode
+            status_row["status"] = "completed" if proc.returncode == 0 and status_row["status"] == "completed" else "failed"
+            status_row["started_at"] = started
+            status_row["finished_at"] = _now_iso()
+            case_status.append(status_row)
+            _write_case_status(wd, case_status)
+            if proc.returncode != 0:
+                break
+    summary = _batch_summary(case_status)
+    failed = summary["failed_cases"] > 0
+    metadata.update(summary)
+    metadata["attempted_cases"] = len(case_status)
+    metadata["resumed_cases"] = resumed_cases
+    metadata["skipped_completed_cases"] = skipped_completed_cases
+    metadata["finished_at"] = _now_iso()
+    metadata["status"] = "failed" if failed else "finished"
+    metadata["exit_code"] = 1 if failed else 0
+    metadata["case_status_csv"] = str(wd / "case_status.csv")
+    metadata["status_json"] = str(wd / "status.json")
+    _write_json(wd / "batch_metadata.json", metadata)
+    _write_status(wd, metadata)
+    (wd / "exit_code").write_text(str(metadata["exit_code"]))
+    return metadata
+
+
+@mcp.tool()
+def run_plate_manifest_batch(
+    pinn_root: str,
+    manifest_path: str,
+    batch_id: str,
+    workers: int,
+    require_geometry_gate: bool = True,
+    raw_dump_policy: str = "do_not_package",
+    overwrite: bool = False,
+    resume: bool = False,
+) -> dict:
+    """Generate and run LIGGGHTS plate cases from a manifest with persistent batch status."""
+    pinn = _resolve_pinn(pinn_root)
+    manifest = _resolve_manifest(pinn, manifest_path)
+    wd = _batch_dir(batch_id)
+    if wd.exists() and not overwrite and not resume:
+        status = _read_status(wd)
+        if status:
+            return status
+        raise RuntimeError(f"batch_id {batch_id} already exists at {wd}; pass overwrite=True or resume=True")
+    return _run_plate_manifest_batch_sync(
+        pinn, manifest, batch_id, workers, require_geometry_gate,
+        raw_dump_policy, overwrite, resume,
+    )
+
+
+@mcp.tool()
+def check_batch_status(batch_id: str, tail: int = 50) -> dict:
+    """Read persistent batch and case status after MCP restarts."""
+    wd = _batch_dir(batch_id)
+    status = _read_status(wd) or _read_json(wd / "batch_metadata.json")
+    rows = _read_case_status(wd)
+    out = {"batch_id": batch_id, "status": "unknown", "exit_code": None}
+    if status:
+        out.update(status)
+    out.update(_batch_summary(rows))
+    out["case_status_csv"] = str(wd / "case_status.csv") if (wd / "case_status.csv").exists() else ""
+    if (wd / "log.run").exists():
+        lines = (wd / "log.run").read_text(errors="replace").splitlines()
+        out["last_log"] = lines[-1] if lines else ""
+        out["log_tail"] = "\n".join(lines[-tail:])
+    else:
+        out["last_log"] = ""
+        out["log_tail"] = ""
+    return out
+
+
+@mcp.tool()
+def list_batch_cases(batch_id: str) -> list[dict]:
+    """List persistent per-case status rows for a manifest batch."""
+    return _read_case_status(_batch_dir(batch_id))
+
+
+@mcp.tool()
+def resume_plate_manifest_batch(
+    batch_id: str,
+    failed_only: bool = True,
+    workers: int | None = None,
+) -> dict:
+    """Resume a manifest batch without rerunning completed cases."""
+    wd = _batch_dir(batch_id)
+    metadata = _read_json(wd / "batch_metadata.json")
+    if not metadata:
+        raise FileNotFoundError(f"batch metadata not found for {batch_id}")
+    return _run_plate_manifest_batch_sync(
+        _resolve_pinn(metadata["pinn_root"]),
+        _resolve_manifest(_resolve_pinn(metadata["pinn_root"]), metadata["manifest_path"]),
+        batch_id,
+        workers or int(metadata.get("workers") or 1),
+        bool(metadata.get("require_geometry_gate", True)),
+        metadata.get("raw_dump_policy", "do_not_package"),
+        overwrite=False,
+        resume=True,
+    )
+
+
+@mcp.tool()
+def postprocess_plate_batch(
+    pinn_root: str,
+    batch_id: str,
+    bins: int = 64,
+    include_tilted_smoke_postprocess: bool = False,
+) -> dict:
+    """Run project postprocessing over a completed manifest batch."""
+    pinn = _resolve_pinn(pinn_root)
+    script = pinn / "scripts" / "postprocess_liggghts_plate_hpc_sweep.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"postprocess script not found: {script}")
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(pinn), capture_output=True, text=True, errors="replace",
+        stdin=subprocess.DEVNULL,
+    )
+    summary_csv = pinn / "outputs" / "plate_reference" / "liggghts_plate_hpc_tier1_sweep_summary.csv"
+    rows = _read_manifest(summary_csv) if summary_csv.exists() else []
+    result = {
+        "batch_id": batch_id,
+        "exit_code": proc.returncode,
+        "stdout_tail": proc.stdout[-2048:],
+        "stderr_tail": proc.stderr[-2048:],
+        "summary_csv": str(summary_csv),
+        "completed_cases": sum(1 for r in rows if str(r.get("settlement_completed", "")).lower() == "true" and str(r.get("intrusion_completed", "")).lower() == "true"),
+        "completed_stable_cases": sum(1 for r in rows if r.get("status") == "completed_stable"),
+        "passed_cases": sum(1 for r in rows if str(r.get("passed", "")).lower() == "true"),
+        "failed_cases": sum(1 for r in rows if str(r.get("passed", "")).lower() != "true"),
+        "liggghts_error_cases": [r.get("case_id") for r in rows if r.get("liggghts_error")],
+        "dangerous_build_cases": [r.get("case_id") for r in rows if int(float(r.get("dangerous_builds") or 0)) > 0],
+        "force_csv_files": len(list((pinn / "hpc" / "liggghts_plate_tier1" / "generated_cases").glob("*/plate_force_raw.csv"))),
+        "contact_count_csv_files": len(list((pinn / "hpc" / "liggghts_plate_tier1" / "generated_cases").glob("*/contact_local.dump"))),
+        "bins": bins,
+    }
+    if include_tilted_smoke_postprocess:
+        tilted = pinn / "scripts" / "postprocess_liggghts_plate_tilted_smoke.py"
+        if not tilted.exists():
+            result["tilted_smoke_postprocess"] = {"status": "missing"}
+        else:
+            tilted_proc = subprocess.run(
+                [sys.executable, str(tilted)],
+                cwd=str(pinn), capture_output=True, text=True, errors="replace",
+                stdin=subprocess.DEVNULL,
+            )
+            result["tilted_smoke_postprocess"] = {
+                "status": "finished" if tilted_proc.returncode == 0 else "failed",
+                "exit_code": tilted_proc.returncode,
+                "stdout_tail": tilted_proc.stdout[-2048:],
+                "stderr_tail": tilted_proc.stderr[-2048:],
+            }
+    return result
+
+
+@mcp.tool()
+def package_compact_return(
+    pinn_root: str,
+    batch_id: str,
+    phase: str,
+    include_linux_done: bool = True,
+    forbid_raw_dumps: bool = True,
+) -> dict:
+    """Create one compact tarball and sha256 file for Windows without raw DEM dumps."""
+    pinn = _resolve_pinn(pinn_root)
+    transfer = pinn / "outputs" / "transfer"
+    transfer.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    tar_path = transfer / f"{phase}_windows_return_{stamp}.tar.gz"
+    sha_path = Path(str(tar_path) + ".sha256")
+    batch = _batch_dir(batch_id)
+    candidates = []
+    for rel in ("outputs/plate_reference", "outputs/mcp", "outputs/pinn_analysis"):
+        path = pinn / rel
+        if path.exists():
+            candidates.append(path)
+    if include_linux_done and (pinn / "codex_tasks" / "linux_done.md").exists():
+        candidates.append(pinn / "codex_tasks" / "linux_done.md")
+    if batch.exists():
+        candidates.extend([p for p in (batch / name for name in ("status.json", "batch_metadata.json", "case_status.csv", "geometry_gate_status.json", "exit_code")) if p.exists()])
+    metadata = {
+        "batch_id": batch_id,
+        "phase": phase,
+        "gpu_used": False,
+        "raw_dumps_packaged": False,
+        "is_reference_quality": False,
+        "is_training_data": False,
+        "mcp_used": True,
+        "mcp_server_version": __version__,
+        "liggghts_bin": LIGGGHTS_BIN,
+    }
+    meta_path = transfer / f"{phase}_mcp_return_metadata_{stamp}.json"
+    _write_json(meta_path, metadata)
+    candidates.append(meta_path)
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for path in candidates:
+            if path.is_dir():
+                for child in path.rglob("*"):
+                    if child.is_file():
+                        if forbid_raw_dumps and child.name in _FORBIDDEN_RAW_DUMPS:
+                            continue
+                        tar.add(child, arcname=str(child.relative_to(pinn)) if pinn in child.parents else child.name)
+            elif path.is_file():
+                if forbid_raw_dumps and path.name in _FORBIDDEN_RAW_DUMPS:
+                    continue
+                tar.add(path, arcname=str(path.relative_to(pinn)) if pinn in path.parents else path.name)
+    with tarfile.open(tar_path, "r:gz") as tar:
+        names = tar.getnames()
+    forbidden = [name for name in names if Path(name).name in _FORBIDDEN_RAW_DUMPS]
+    package_verified = not forbidden
+    if forbidden and forbid_raw_dumps:
+        tar_path.unlink(missing_ok=True)
+    digest = hashlib.sha256(tar_path.read_bytes()).hexdigest() if tar_path.exists() else ""
+    if digest:
+        sha_path.write_text(f"{digest}  {tar_path.name}\n")
+    return {
+        "tar_gz": str(tar_path),
+        "sha256": str(sha_path) if sha_path.exists() else "",
+        "raw_dumps_packaged": bool(forbidden),
+        "forbidden_entries": forbidden,
+        "package_verified": package_verified,
     }
 
 

@@ -13,7 +13,7 @@
 
 ### What is this
 
-A thin MCP wrapper around the `liggghts` binary. Instead of hand-writing `.in` decks and managing background processes, you describe what you want in natural language and the agent calls these tools:
+A thin MCP wrapper around the `liggghts` binary, plus project-aware orchestration tools for PINN plate DEM batches. Instead of hand-writing `.in` decks and managing background processes, you describe what you want in natural language and the agent calls these tools:
 
 | Tool | Purpose |
 |------|---------|
@@ -28,6 +28,14 @@ A thin MCP wrapper around the `liggghts` binary. Instead of hand-writing `.in` d
 | `list_dumps(run_id)` | Thin alias: dump/vtk/restart/post only |
 | `list_runs()` | Status of every known run (reads `status.json`) |
 | `stop_simulation(run_id)` | SIGTERM the run (SIGKILL if it ignores). Records `terminated_by_mcp: true` and `termination_signal: "SIGTERM"\|"SIGKILL"` in `status.json` so postprocess can distinguish a user-requested stop from a simulation crash |
+| `validate_project_environment(pinn_root, require_serial_liggghts, run_parse_probe, run_runtime_probe)` | Validate a PINN project root before broad DEM work: required scripts, environment file, LIGGGHTS probes, run-root write access, serial/CPU-only metadata, and `gpu_used=false` |
+| `run_tilt_geometry_gates(pinn_root, tilts_deg, workers, overwrite)` | Run available geometry/contact gates before tilted plate batches. If true per-tilt gates are not available in the PINN checkout, unsupported tilts are reported as failed so broad DEM does not start silently |
+| `run_plate_manifest_batch(pinn_root, manifest_path, batch_id, workers, require_geometry_gate, raw_dump_policy, overwrite, resume)` | Read an explicit project manifest, generate each listed case with `--case-id`, run cases through the project runner, and persist `status.json`, `batch_metadata.json`, `case_status.csv`, `exit_code`, and `log.run`. It preserves `is_reference_quality=false` and `is_training_data=false` and never uses `--all` |
+| `check_batch_status(batch_id, tail)` | Read persistent batch status and case counts after MCP restarts |
+| `list_batch_cases(batch_id)` | Return the per-case rows from `case_status.csv` |
+| `resume_plate_manifest_batch(batch_id, failed_only, workers)` | Resume a manifest batch without rerunning completed exit-code-0 cases |
+| `postprocess_plate_batch(pinn_root, batch_id, bins, include_tilted_smoke_postprocess)` | Run project plate postprocessing and report completed, passed, failed, error, dangerous-build, force CSV, and contact-count output counts |
+| `package_compact_return(pinn_root, batch_id, phase, include_linux_done, forbid_raw_dumps)` | Create `outputs/transfer/<phase>_windows_return_<timestamp>.tar.gz` and `.sha256`, verify forbidden raw DEM dumps are absent, and write MCP/safety metadata |
 
 Each run lives in its own directory under `~/liggghts_runs/<run_id>/` with `input.in`, `log.run`, `pid`, `status.json`, plus whatever LIGGGHTS writes (`log.liggghts`, dumps, restart files). The launch wrapper writes the child process's exit code to `<run_dir>/exit_code` after the command finishes, and `status.json` records `started_at`, `finished_at`, `exit_code`, `kind`, and `case_dir_outputs` (for `run_plate_case`) — so a finished run keeps its exit code across MCP server restarts even if `Popen.poll()` is no longer available.
 
@@ -68,7 +76,7 @@ claude mcp list
 # liggghts: ... - ✓ Connected
 ```
 
-Open a new Claude Code session and the 7 tools become available.
+Open a new Claude Code session and the tools become available.
 
 ### Reloading after an upgrade
 
@@ -147,7 +155,7 @@ MIT. LIGGGHTS itself is GPL-2; this wrapper does not link against LIGGGHTS code,
 
 ### 这是什么
 
-一个轻量 MCP 服务器，把 `liggghts` 命令行包装成 7 个工具，让 LLM agent (Claude Code 等) 直接驱动颗粒动力学仿真。你用自然语言描述要做什么，Agent 自动写 deck、启动、监控、读结果。
+一个轻量 MCP 服务器，把 `liggghts` 命令行和 PINN plate DEM 项目批处理包装成工具，让 LLM agent (Claude Code 等) 直接驱动颗粒动力学仿真。你用自然语言描述要做什么，Agent 自动写 deck、启动、监控、读结果。
 
 | 工具 | 用途 |
 |------|------|
@@ -162,6 +170,14 @@ MIT. LIGGGHTS itself is GPL-2; this wrapper does not link against LIGGGHTS code,
 | `list_dumps(run_id)` | 薄封装：仅 dump / vtk / restart / post |
 | `list_runs()` | 所有 case 的状态总览（读 `status.json`） |
 | `stop_simulation(run_id)` | SIGTERM (失败再 SIGKILL)。会在 `status.json` 写入 `terminated_by_mcp: true` 和 `termination_signal: "SIGTERM"\|"SIGKILL"`，让后处理能区分"用户主动停"和"仿真崩了" |
+| `validate_project_environment(pinn_root, require_serial_liggghts, run_parse_probe, run_runtime_probe)` | 在大批量 DEM 前验证 PINN 项目根目录、必需脚本、environment 文件、LIGGGHTS probes、run root 写权限、串行/CPU-only 元数据，并明确 `gpu_used=false` |
+| `run_tilt_geometry_gates(pinn_root, tilts_deg, workers, overwrite)` | 在 tilted plate 批处理前运行可用的几何/接触 gate；如果当前 PINN checkout 没有真正的逐倾角 gate，会把不支持的 tilt 标成 failed，避免静默启动大批 DEM |
+| `run_plate_manifest_batch(pinn_root, manifest_path, batch_id, workers, require_geometry_gate, raw_dump_policy, overwrite, resume)` | 读取显式 manifest，逐个 `--case-id` 生成 case，通过项目 runner 执行，并持久化 `status.json`、`batch_metadata.json`、`case_status.csv`、`exit_code`、`log.run`；保留 `is_reference_quality=false` / `is_training_data=false`，永不使用 `--all` |
+| `check_batch_status(batch_id, tail)` | MCP 重启后读取持久化 batch 状态和 case 计数 |
+| `list_batch_cases(batch_id)` | 返回 `case_status.csv` 中的逐 case 状态 |
+| `resume_plate_manifest_batch(batch_id, failed_only, workers)` | 继续 manifest batch，不重跑已完成且 exit-code-0 的 case |
+| `postprocess_plate_batch(pinn_root, batch_id, bins, include_tilted_smoke_postprocess)` | 运行项目 plate 后处理，报告 completed / passed / failed / error / dangerous-build / force CSV / contact-count 输出数量 |
+| `package_compact_return(pinn_root, batch_id, phase, include_linux_done, forbid_raw_dumps)` | 创建 `outputs/transfer/<phase>_windows_return_<timestamp>.tar.gz` 和 `.sha256`，验证 raw DEM dump 未进入包，并写入 MCP/safety metadata |
 
 每个 run 独立目录在 `~/liggghts_runs/<run_id>/`，里面有 `input.in`、`log.run`、`pid`、`status.json`、以及 LIGGGHTS 自己写的 `log.liggghts` 和 dump 文件。启动 wrapper 在子进程结束时把退出码写入 `<run_dir>/exit_code`，`status.json` 记录 `started_at` / `finished_at` / `exit_code` / `kind` / `case_dir_outputs`（`run_plate_case` 才有），即使 MCP server 重启导致 `Popen.poll()` 不可用，已完成 run 的退出码也不会丢。
 
@@ -202,7 +218,7 @@ claude mcp list
 # liggghts: ... - ✓ Connected
 ```
 
-新开一个 Claude Code 会话，7 个工具就可用了。
+新开一个 Claude Code 会话，工具就可用了。
 
 ### 升级后必须重启 MCP
 
