@@ -90,6 +90,14 @@ validate_liggghts_bin(
 
 If the only available binary is a system package such as `/usr/bin/liggghts` and the MPI probe fails with socket/permission errors, stop and fix the launcher/build instead of forcing a broad MPI run.
 
+### Field-tested RFT runbook
+
+For the two-plate RFT equivalent-sphere depth/spacing sweep workflow, see
+[docs/operations/rft_equivalent_sphere_depth_spacing.md](docs/operations/rft_equivalent_sphere_depth_spacing.md).
+It records the tested 3-concurrent-case / 32-MPI-rank operating mode, sparse
+visual dumps, dense force output, file-based monitoring, and the safety rule
+for updating MCP without interrupting long-running LIGGGHTS jobs.
+
 ### Install
 
 ```bash
@@ -268,6 +276,12 @@ validate_liggghts_bin(
 ```
 
 如果只能找到 `/usr/bin/liggghts` 这类系统包，并且 MPI probe 报 socket/permission 错误，应该先修 launcher 或重编译，不要硬上大批量 MPI。
+
+### 已验证的 RFT 运行手册
+
+两板 RFT 等效球 depth/spacing sweep 的实际运行经验记录在
+[docs/operations/rft_equivalent_sphere_depth_spacing.md](docs/operations/rft_equivalent_sphere_depth_spacing.md)。
+其中包括已验证的 `3` 并发 case、每例 `32` MPI rank、稀疏可视化 dump、密集力输出、基于文件的监控方式，以及更新 MCP 时不打断长时间 LIGGGHTS 任务的安全规则。
 
 ### 安装
 
