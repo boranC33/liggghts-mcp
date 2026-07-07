@@ -12,7 +12,7 @@ it like a controlled job launcher, not a sandbox.
   set.
 - `start_from_file` and `start_from_dir` can be scoped with
   `LIGGGHTS_ALLOWED_CASE_ROOTS`.
-- MPI ranks, concurrent runs, sweep case counts, output read sizes, deck
+- MPI ranks, concurrent runs, sweep case counts, batch case counts, output read sizes, deck
   validation timeout, dump analysis sizes, and visualization command timeout
   can be bounded with the environment variables documented in `README.md`.
 - OVITO/ParaView commands execute local binaries and Python modules. Configure
@@ -27,6 +27,7 @@ LIGGGHTS_ALLOW_DECK_SHELL=0
 LIGGGHTS_MAX_RANKS=8
 LIGGGHTS_MAX_CONCURRENT_RUNS=2
 LIGGGHTS_MAX_SWEEP_CASES=16
+LIGGGHTS_MAX_BATCH_CASES=32
 LIGGGHTS_MAX_READ_BYTES=262144
 LIGGGHTS_MAX_ANALYSIS_BYTES=33554432
 LIGGGHTS_VIS_TIMEOUT=300

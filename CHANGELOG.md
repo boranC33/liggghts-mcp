@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0
+
+- Added advanced DEM scaffolds via `create_advanced_dem_template` for
+  inclined chute, rotating drum, direct shear cell, and hopper-flow workflows.
+- Added calibration workflow tools:
+  `start_calibration_sweep`, `evaluate_calibration`, and
+  `suggest_calibration_cases`.
+- Added batch scheduling tools:
+  `prepare_batch`, `start_batch`, `batch_status`, and `list_batches`.
+- Added `LIGGGHTS_MAX_BATCH_CASES` to bound prepared batch size.
+
 ## 0.7.1
 
 - Fixed the generated `silo_discharge` starter deck so primitive `zcylinder`

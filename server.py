@@ -20,7 +20,7 @@ from pathlib import Path
 
 mcp = FastMCP("liggghts")
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 LIGGGHTS_BIN = os.environ.get("LIGGGHTS_BIN", "/usr/local/bin/liggghts")
 RUNS = Path(os.environ.get("LIGGGHTS_RUNS", Path.home() / "liggghts_runs"))
@@ -136,6 +136,13 @@ def _max_sweep_cases() -> int:
     value = _env_int("LIGGGHTS_MAX_SWEEP_CASES", 32)
     if value is None or value < 1:
         raise ValueError("LIGGGHTS_MAX_SWEEP_CASES must be >= 1")
+    return value
+
+
+def _max_batch_cases() -> int:
+    value = _env_int("LIGGGHTS_MAX_BATCH_CASES", 64)
+    if value is None or value < 1:
+        raise ValueError("LIGGGHTS_MAX_BATCH_CASES must be >= 1")
     return value
 
 
@@ -813,6 +820,532 @@ def _build_dem_case_deck(
         "warnings": warnings,
     }
     return deck, metadata
+
+
+def _advanced_template_type(value: str) -> str:
+    aliases = {
+        "chute": "inclined_chute",
+        "inclined_plane": "inclined_chute",
+        "drum": "rotating_drum",
+        "mixer": "rotating_drum",
+        "shear": "direct_shear_cell",
+        "direct_shear": "direct_shear_cell",
+        "hopper": "hopper_flow",
+        "silo": "hopper_flow",
+    }
+    key = value.strip().lower()
+    key = aliases.get(key, key)
+    allowed = {"inclined_chute", "rotating_drum", "direct_shear_cell", "hopper_flow"}
+    if key not in allowed:
+        raise ValueError(
+            "template_type must be one of: inclined_chute, rotating_drum, "
+            "direct_shear_cell, hopper_flow"
+        )
+    return key
+
+
+def _advanced_insert_lines(
+    *,
+    particle_count: int,
+    material_density_kg_m3: float,
+    radius: float,
+    region_line: str,
+) -> list[str]:
+    return [
+        f"fix             mcp_template all particletemplate/sphere 15485863 atom_type 1 density constant {_fmt(material_density_kg_m3)} radius constant {_fmt(radius)}",
+        "fix             mcp_distribution all particledistribution/discrete 15485867 1 mcp_template 1.0",
+        region_line,
+        (
+            "fix             mcp_insert all insert/pack seed 32452843 "
+            "distributiontemplate mcp_distribution vel constant 0.0 0.0 0.0 "
+            f"insert_every 100 overlapcheck yes all_in yes particles_in_region {particle_count} region mcp_insert"
+        ),
+    ]
+
+
+def _build_advanced_template_deck(
+    *,
+    template_type: str,
+    particle_count: int,
+    particle_diameter_m: float,
+    material_density_kg_m3: float,
+    material: dict | None,
+    domain: dict | None,
+    run_steps: int,
+    settle_steps: int,
+    timestep_s: float,
+    dump_every: int,
+    options: dict | None,
+) -> tuple[str, dict]:
+    template_type = _advanced_template_type(template_type)
+    if template_type == "hopper_flow":
+        deck, metadata = _build_dem_case_deck(
+            case_type="silo_discharge",
+            particle_count=particle_count,
+            particle_diameter_m=particle_diameter_m,
+            material_density_kg_m3=material_density_kg_m3,
+            material=material,
+            domain=domain,
+            run_steps=run_steps,
+            settle_steps=settle_steps,
+            timestep_s=timestep_s,
+            dump_every=dump_every,
+        )
+        metadata.update({"template_type": template_type})
+        metadata["warnings"].append(
+            "hopper_flow is a primitive-wall scaffold; replace with mesh walls "
+            "for a production hopper/orifice"
+        )
+        return deck.replace(
+            "# case_type silo_discharge",
+            "# template_type hopper_flow\n# case_type silo_discharge",
+            1,
+        ), metadata
+
+    particle_count = int(particle_count)
+    if particle_count < 1:
+        raise ValueError("particle_count must be >= 1")
+    particle_diameter_m = _positive_float(particle_diameter_m, "particle_diameter_m")
+    material_density_kg_m3 = _positive_float(
+        material_density_kg_m3, "material_density_kg_m3"
+    )
+    timestep_s = _positive_float(timestep_s, "timestep_s")
+    run_steps = _nonnegative_int(run_steps, "run_steps")
+    settle_steps = _nonnegative_int(settle_steps, "settle_steps")
+    dump_every = int(dump_every)
+    if dump_every < 1:
+        raise ValueError("dump_every must be >= 1")
+    options = options or {}
+    box = _box_from_domain(
+        domain,
+        particle_count=particle_count,
+        particle_diameter_m=particle_diameter_m,
+        case_type="box_settle",
+    )
+    mat = _material_defaults(material)
+    radius = particle_diameter_m / 2.0
+    margin = max(2.5 * particle_diameter_m, 0.04 * box["width_m"])
+    x_inner = max(radius, box["width_m"] / 2.0 - margin)
+    y_inner = max(radius, box["depth_m"] / 2.0 - margin)
+    warnings: list[str] = []
+
+    gravity_vec = "0.0 0.0 -1.0"
+    wall_lines: list[str] = []
+    insertion_lines: list[str] = []
+    phase_lines: list[str] = []
+    comments: list[str] = []
+
+    if template_type == "inclined_chute":
+        angle_deg = float(options.get("angle_deg", 25.0))
+        angle = math.radians(angle_deg)
+        gravity_vec = f"{_fmt(math.sin(angle))} 0.0 {_fmt(-math.cos(angle))}"
+        insert_zlo = max(3.0 * radius, 0.15 * box["height_m"])
+        insert_zhi = min(box["zhi"] - radius, 0.88 * box["height_m"])
+        wall_lines = [
+            "fix             mcp_floor all wall/gran model hertz tangential history primitive type 1 zplane 0.0",
+            f"fix             mcp_ylo all wall/gran model hertz tangential history primitive type 1 yplane {_fmt(box['ylo'])}",
+            f"fix             mcp_yhi all wall/gran model hertz tangential history primitive type 1 yplane {_fmt(box['yhi'])}",
+        ]
+        insertion_lines = _advanced_insert_lines(
+            particle_count=particle_count,
+            material_density_kg_m3=material_density_kg_m3,
+            radius=radius,
+            region_line=(
+                "region          mcp_insert block "
+                f"{_fmt(box['xlo'] + margin)} {_fmt(box['xhi'] - margin)} "
+                f"{_fmt(-y_inner)} {_fmt(y_inner)} "
+                f"{_fmt(insert_zlo)} {_fmt(insert_zhi)} units box"
+            ),
+        )
+        phase_lines = [
+            f"run             {settle_steps}",
+            "unfix           mcp_insert",
+            f"run             {run_steps}",
+        ]
+        comments.append(f"# chute_angle_deg {angle_deg}")
+    elif template_type == "rotating_drum":
+        drum_radius = float(options.get("drum_radius_m", min(box["width_m"], box["depth_m"]) * 0.45))
+        drum_radius = _positive_float(drum_radius, "drum_radius_m")
+        rotation_rpm = float(options.get("rotation_rpm", 10.0))
+        insert_zlo = max(3.0 * radius, 0.15 * box["height_m"])
+        insert_zhi = min(box["zhi"] - radius, 0.80 * box["height_m"])
+        wall_lines = [
+            f"fix             mcp_drum_wall all wall/gran model hertz tangential history primitive type 1 zcylinder {_fmt(drum_radius)} 0.0 0.0",
+            "fix             mcp_drum_floor all wall/gran model hertz tangential history primitive type 1 zplane 0.0",
+            f"fix             mcp_drum_lid all wall/gran model hertz tangential history primitive type 1 zplane {_fmt(box['zhi'])}",
+        ]
+        insertion_lines = _advanced_insert_lines(
+            particle_count=particle_count,
+            material_density_kg_m3=material_density_kg_m3,
+            radius=radius,
+            region_line=(
+                "region          mcp_insert cylinder z 0.0 0.0 "
+                f"{_fmt(drum_radius * 0.75)} {_fmt(insert_zlo)} {_fmt(insert_zhi)} units box"
+            ),
+        )
+        phase_lines = [
+            f"run             {settle_steps}",
+            "unfix           mcp_insert",
+            "# Primitive cylinder walls are stationary in this scaffold.",
+            "# For real rotation, replace the primitive wall with a mesh wall and fix move/mesh.",
+            f"run             {run_steps}",
+        ]
+        warnings.append(
+            "rotating_drum is a stationary primitive-wall scaffold; use mesh walls "
+            "and fix move/mesh for physical rotation"
+        )
+        comments.append(f"# requested_rotation_rpm {rotation_rpm}")
+    else:
+        shear_velocity = float(options.get("shear_velocity_m_s", 0.01))
+        top_z = float(options.get("top_wall_z_m", box["height_m"] * 0.65))
+        if top_z <= 4.0 * radius:
+            raise ValueError("top_wall_z_m is too small for the selected particle diameter")
+        insert_zlo = max(3.0 * radius, 0.10 * top_z)
+        insert_zhi = min(top_z - 2.0 * radius, 0.85 * top_z)
+        wall_lines = [
+            f"fix             mcp_xlo all wall/gran model hertz tangential history primitive type 1 xplane {_fmt(box['xlo'])}",
+            f"fix             mcp_xhi all wall/gran model hertz tangential history primitive type 1 xplane {_fmt(box['xhi'])}",
+            f"fix             mcp_ylo all wall/gran model hertz tangential history primitive type 1 yplane {_fmt(box['ylo'])}",
+            f"fix             mcp_yhi all wall/gran model hertz tangential history primitive type 1 yplane {_fmt(box['yhi'])}",
+            "fix             mcp_bottom all wall/gran model hertz tangential history primitive type 1 zplane 0.0",
+            f"fix             mcp_top all wall/gran model hertz tangential history primitive type 1 zplane {_fmt(top_z)}",
+        ]
+        insertion_lines = _advanced_insert_lines(
+            particle_count=particle_count,
+            material_density_kg_m3=material_density_kg_m3,
+            radius=radius,
+            region_line=(
+                "region          mcp_insert block "
+                f"{_fmt(-x_inner)} {_fmt(x_inner)} "
+                f"{_fmt(-y_inner)} {_fmt(y_inner)} "
+                f"{_fmt(insert_zlo)} {_fmt(insert_zhi)} units box"
+            ),
+        )
+        phase_lines = [
+            f"run             {settle_steps}",
+            "unfix           mcp_insert",
+            "# Direct shear scaffold: primitive top wall is stationary.",
+            "# For production shear, use a mesh top plate and fix move/mesh with the target velocity.",
+            f"run             {run_steps}",
+        ]
+        warnings.append(
+            "direct_shear_cell uses stationary primitive walls; use a mesh plate "
+            "and fix move/mesh for physical shear"
+        )
+        comments.append(f"# requested_shear_velocity_m_s {_fmt(shear_velocity)}")
+
+    base_lines = [
+        "# Generated by liggghts-mcp create_advanced_dem_template",
+        f"# template_type {template_type}",
+        *comments,
+        "units           si",
+        "atom_style      granular",
+        "atom_modify     map array",
+        "boundary        f f f",
+        "newton          off",
+        "communicate     single vel yes",
+        "",
+        (
+            "region          mcp_domain block "
+            f"{_fmt(box['xlo'])} {_fmt(box['xhi'])} "
+            f"{_fmt(box['ylo'])} {_fmt(box['yhi'])} "
+            f"{_fmt(box['zlo'])} {_fmt(box['zhi'])} units box"
+        ),
+        "create_box      1 mcp_domain",
+        "",
+        f"neighbor        {_fmt(max(radius * 0.4, 1.0e-6))} bin",
+        "neigh_modify    delay 0",
+        "",
+        *_dem_material_lines(mat),
+        "",
+        "pair_style      gran model hertz tangential history",
+        "pair_coeff      * *",
+        "",
+        f"timestep        {_fmt(timestep_s)}",
+        f"fix             mcp_gravity all gravity 9.81 vector {gravity_vec}",
+        "fix             mcp_integrate all nve/sphere",
+        "",
+    ]
+    output_lines = [
+        f"thermo          {dump_every}",
+        "thermo_style    custom step atoms ke",
+        (
+            f"dump            mcp_dump all custom {dump_every} particles.lammpstrj "
+            "id type x y z vx vy vz radius"
+        ),
+        "dump_modify     mcp_dump sort id",
+        f"restart         {max(dump_every, 1) * 10} restart.*.liggghts",
+        "",
+    ]
+    deck = "\n".join(
+        base_lines + wall_lines + [""] + insertion_lines + [""] + output_lines + phase_lines
+    ).rstrip() + "\n"
+    metadata = {
+        "template_type": template_type,
+        "particle_count": particle_count,
+        "particle_diameter_m": particle_diameter_m,
+        "particle_radius_m": radius,
+        "material_density_kg_m3": material_density_kg_m3,
+        "material": mat,
+        "domain": box,
+        "run_steps": run_steps,
+        "settle_steps": settle_steps,
+        "timestep_s": timestep_s,
+        "dump_every": dump_every,
+        "options": options,
+        "warnings": warnings,
+    }
+    return deck, metadata
+
+
+def _management_dir(name: str) -> Path:
+    if name not in {"_batches", "_calibrations"}:
+        raise ValueError("invalid management dir")
+    path = RUNS / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _batch_dir(batch_id: str) -> Path:
+    safe = _slugify(batch_id, "batch")
+    return (_management_dir("_batches") / safe).resolve()
+
+
+def _calibration_dir() -> Path:
+    return _management_dir("_calibrations")
+
+
+def _read_json_file(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _read_batch_manifest(batch_id: str) -> dict:
+    path = RUNS / "_batches" / _slugify(batch_id, "batch") / "batch.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"batch not found: {batch_id}")
+    data = _read_json_file(path)
+    if not data:
+        raise ValueError(f"batch manifest is invalid: {batch_id}")
+    return data
+
+
+def _write_batch_manifest(batch_id: str, manifest: dict) -> None:
+    path = _batch_dir(batch_id)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "batch.json").write_text(json.dumps(manifest, indent=2))
+
+
+def _deck_from_case_spec(spec: dict, index: int) -> tuple[str, dict]:
+    if not isinstance(spec, dict):
+        raise TypeError("each batch case must be a dict")
+    if "input_script" in spec:
+        deck = str(spec["input_script"])
+        metadata = {
+            "source": "input_script",
+            "parameters": spec.get("parameters", {}),
+            "warnings": [],
+        }
+    elif "template" in spec:
+        values = spec.get("parameters", {})
+        if not isinstance(values, dict):
+            raise TypeError("case parameters must be a dict")
+        deck = _render_template(str(spec["template"]), values)
+        metadata = {
+            "source": "template",
+            "parameters": values,
+            "warnings": [],
+        }
+    elif "advanced_template" in spec or "template_type" in spec:
+        params = {
+            "template_type": spec.get("advanced_template", spec.get("template_type")),
+            "particle_count": spec.get("particle_count", 1000),
+            "particle_diameter_m": spec.get("particle_diameter_m", 0.002),
+            "material_density_kg_m3": spec.get("material_density_kg_m3", 2500.0),
+            "material": spec.get("material"),
+            "domain": spec.get("domain"),
+            "run_steps": spec.get("run_steps", 10000),
+            "settle_steps": spec.get("settle_steps", 10000),
+            "timestep_s": spec.get("timestep_s", 1.0e-5),
+            "dump_every": spec.get("dump_every", 1000),
+            "options": spec.get("options", {}),
+        }
+        deck, metadata = _build_advanced_template_deck(**params)
+        metadata["source"] = "advanced_template"
+    else:
+        params = {
+            "case_type": spec.get("case_type", "box_settle"),
+            "particle_count": spec.get("particle_count", 1000),
+            "particle_diameter_m": spec.get("particle_diameter_m", 0.002),
+            "material_density_kg_m3": spec.get("material_density_kg_m3", 2500.0),
+            "material": spec.get("material"),
+            "domain": spec.get("domain"),
+            "run_steps": spec.get("run_steps", 10000),
+            "settle_steps": spec.get("settle_steps", 10000),
+            "timestep_s": spec.get("timestep_s", 1.0e-5),
+            "dump_every": spec.get("dump_every", 1000),
+        }
+        deck, metadata = _build_dem_case_deck(**params)
+        metadata["source"] = "dem_case"
+    if not deck.strip():
+        raise ValueError(f"case {index} generated an empty deck")
+    return deck, metadata
+
+
+def _dict_path(data: dict, path: str):
+    current = data
+    for part in path.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return current
+
+
+def _latest_analysis_metrics(run_id: str) -> dict | None:
+    records = list_output_details(run_id, patterns=["analysis/*_metrics.json"])
+    if not records:
+        return None
+    records.sort(key=lambda rec: Path(rec["path"]).stat().st_mtime, reverse=True)
+    data = _read_json_file(Path(records[0]["path"]))
+    return data or None
+
+
+def _target_spec(raw) -> dict:
+    if isinstance(raw, dict):
+        if "target" not in raw:
+            raise ValueError("target metric specs must contain 'target'")
+        target = float(raw["target"])
+        weight = float(raw.get("weight", 1.0))
+        tolerance = raw.get("tolerance")
+    else:
+        target = float(raw)
+        weight = 1.0
+        tolerance = None
+    if weight < 0:
+        raise ValueError("target weight must be >= 0")
+    if tolerance is None:
+        tolerance = abs(target) if abs(target) > 1.0e-12 else 1.0
+    tolerance = float(tolerance)
+    if tolerance <= 0:
+        raise ValueError("target tolerance must be > 0")
+    return {"target": target, "weight": weight, "tolerance": tolerance}
+
+
+def _numeric_metric(value) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _calibration_score(data: dict, targets: dict, missing_penalty: float) -> tuple[float, list[dict]]:
+    score = 0.0
+    metrics: list[dict] = []
+    for path, raw_spec in targets.items():
+        spec = _target_spec(raw_spec)
+        actual_raw = _dict_path(data, path)
+        actual = _numeric_metric(actual_raw)
+        if actual is None:
+            contribution = missing_penalty * spec["weight"]
+            metrics.append(
+                {
+                    "path": path,
+                    "target": spec["target"],
+                    "actual": actual_raw,
+                    "ok": False,
+                    "error": "missing or non-numeric metric",
+                    "contribution": contribution,
+                }
+            )
+            score += contribution
+            continue
+        error = actual - spec["target"]
+        normalized_abs_error = abs(error) / spec["tolerance"]
+        contribution = normalized_abs_error * spec["weight"]
+        score += contribution
+        metrics.append(
+            {
+                "path": path,
+                "target": spec["target"],
+                "actual": actual,
+                "weight": spec["weight"],
+                "tolerance": spec["tolerance"],
+                "error": error,
+                "normalized_abs_error": normalized_abs_error,
+                "contribution": contribution,
+                "ok": True,
+            }
+        )
+    return score, metrics
+
+
+def _calibration_suggestions(
+    best_parameters: dict,
+    parameter_bounds: dict | None,
+    relative_step: float,
+    include_center: bool,
+    max_cases: int,
+) -> list[dict]:
+    if not best_parameters:
+        raise ValueError("best_parameters must not be empty")
+    if relative_step <= 0:
+        raise ValueError("relative_step must be > 0")
+    if max_cases < 1:
+        raise ValueError("max_cases must be >= 1")
+    bounds = parameter_bounds or {}
+    suggestions: list[dict] = []
+    seen: set[str] = set()
+
+    def add(params: dict, reason: str) -> None:
+        if len(suggestions) >= max_cases:
+            return
+        key = json.dumps(params, sort_keys=True)
+        if key in seen:
+            return
+        seen.add(key)
+        suggestions.append({"parameters": params, "reason": reason})
+
+    if include_center:
+        add(dict(best_parameters), "center")
+
+    for name, raw_value in best_parameters.items():
+        value = float(raw_value)
+        lo = None
+        hi = None
+        if name in bounds:
+            bound = bounds[name]
+            if not isinstance(bound, list) or len(bound) != 2:
+                raise ValueError(f"parameter_bounds[{name!r}] must be [min, max]")
+            lo = float(bound[0])
+            hi = float(bound[1])
+            if hi < lo:
+                raise ValueError(f"parameter_bounds[{name!r}] has max < min")
+            span = hi - lo
+            step = span * relative_step if span > 0 else max(abs(value), 1.0) * relative_step
+        else:
+            step = max(abs(value), 1.0) * relative_step
+        for direction, label in ((-1.0, "lower"), (1.0, "higher")):
+            candidate = value + direction * step
+            if lo is not None:
+                candidate = max(lo, candidate)
+            if hi is not None:
+                candidate = min(hi, candidate)
+            params = dict(best_parameters)
+            params[name] = candidate
+            add(params, f"{label}_{name}")
+    return suggestions
 
 
 def _sha256_file(path: Path) -> str:
@@ -2176,6 +2709,114 @@ def create_dem_case(
 
 
 @mcp.tool()
+def create_advanced_dem_template(
+    template_type: str = "inclined_chute",
+    name: str | None = None,
+    particle_count: int = 1000,
+    particle_diameter_m: float = 0.002,
+    material_density_kg_m3: float = 2500.0,
+    material: dict | None = None,
+    domain: dict | None = None,
+    run_steps: int = 10000,
+    settle_steps: int = 10000,
+    timestep_s: float = 1.0e-5,
+    dump_every: int = 1000,
+    options: dict | None = None,
+    write_case: bool = True,
+    start: bool = False,
+    num_procs: int = 1,
+    overwrite: bool = False,
+    mpirun: str = "mpirun",
+) -> dict:
+    """Create advanced DEM workflow scaffolds.
+
+    Supported `template_type` values:
+      - `inclined_chute`: tilted-gravity chute-flow scaffold
+      - `rotating_drum`: cylindrical drum scaffold with rotation metadata
+      - `direct_shear_cell`: shear-cell scaffold with top/bottom plates
+      - `hopper_flow`: primitive hopper/silo scaffold
+
+    Some advanced physical motions, especially rotating drums and shear plates,
+    need mesh walls plus `fix move/mesh` for production use. This tool produces
+    executable starter decks and records warnings where the scaffold is not a
+    full physical apparatus.
+    """
+    if write_case or start:
+        _ensure_write_allowed("create_advanced_dem_template")
+    _validate_rank_count(num_procs, "num_procs")
+    deck, metadata = _build_advanced_template_deck(
+        template_type=template_type,
+        particle_count=particle_count,
+        particle_diameter_m=particle_diameter_m,
+        material_density_kg_m3=material_density_kg_m3,
+        material=material,
+        domain=domain,
+        run_steps=run_steps,
+        settle_steps=settle_steps,
+        timestep_s=timestep_s,
+        dump_every=dump_every,
+        options=options,
+    )
+    findings = _estimate_deck(deck, num_procs=num_procs)
+    run_id = _slugify(name or f"{metadata['template_type']}_{uuid.uuid4().hex[:8]}")
+    result = {
+        "run_id": run_id,
+        "template_type": metadata["template_type"],
+        "deck": deck,
+        "metadata": metadata,
+        "validation": findings,
+        "written": False,
+        "started": False,
+    }
+    if not write_case and not start:
+        return result
+
+    _ensure_concurrency_capacity(1 if start else 0)
+    wd = _prepare_run_dir(run_id, overwrite)
+    wd.mkdir(parents=True)
+    (wd / "input.in").write_text(deck)
+    (wd / "case.json").write_text(json.dumps(metadata, indent=2))
+    result.update(
+        {
+            "written": True,
+            "work_dir": str(wd),
+            "input_relpath": "input.in",
+            "case_metadata_relpath": "case.json",
+        }
+    )
+    if not start:
+        status = {
+            "run_id": run_id,
+            "status": "created",
+            "kind": "create_advanced_dem_template",
+            "created_at": _now_iso(),
+            "work_dir": str(wd),
+            "input_relpath": "input.in",
+            "template_type": metadata["template_type"],
+        }
+        _write_status(wd, status)
+        result["status"] = status
+        return result
+
+    _validate_deck_safety(deck)
+    cmd = _liggghts_cmd(["-in", "input.in"], num_procs, mpirun)
+    status = _launch(
+        wd,
+        cmd,
+        run_id=run_id,
+        extra_status={
+            "kind": "create_advanced_dem_template",
+            "template_type": metadata["template_type"],
+            "num_procs": num_procs,
+            "mpi_ranks": num_procs,
+            **_mpi_status_fields(num_procs, mpirun),
+        },
+    )
+    result.update({"started": True, "status": status})
+    return result
+
+
+@mcp.tool()
 def start_simulation(
     input_script: str,
     num_procs: int = 1,
@@ -2261,6 +2902,58 @@ def start_parameter_sweep(
         status.update(persisted)
         runs.append(status)
     return {"sweep_id": sweep_id, "case_count": len(runs), "runs": runs}
+
+
+@mcp.tool()
+def start_calibration_sweep(
+    template: str,
+    parameters: dict,
+    targets: dict,
+    name_prefix: str | None = None,
+    num_procs: int = 1,
+    overwrite: bool = False,
+    mpirun: str = "mpirun",
+) -> dict:
+    """Start a parameter sweep and attach calibration target metadata."""
+    if not targets:
+        raise ValueError("targets must not be empty")
+    for spec in targets.values():
+        _target_spec(spec)
+    result = start_parameter_sweep(
+        template,
+        parameters,
+        name_prefix=name_prefix or f"calib_{uuid.uuid4().hex[:8]}",
+        num_procs=num_procs,
+        overwrite=overwrite,
+        mpirun=mpirun,
+    )
+    calibration_id = result["sweep_id"]
+    for run in result["runs"]:
+        wd = _run_dir(run["run_id"])
+        status = _read_status(wd)
+        status.update(
+            {
+                "kind": "calibration_sweep",
+                "calibration_id": calibration_id,
+                "calibration_targets": targets,
+            }
+        )
+        _write_status(wd, status)
+        run.update(status)
+    manifest = {
+        "calibration_id": calibration_id,
+        "kind": "calibration_sweep",
+        "targets": targets,
+        "parameters": parameters,
+        "run_ids": [run["run_id"] for run in result["runs"]],
+        "created_at": _now_iso(),
+    }
+    calib_dir = _calibration_dir()
+    (calib_dir / f"{calibration_id}.json").write_text(json.dumps(manifest, indent=2))
+    result["calibration_id"] = calibration_id
+    result["targets"] = targets
+    result["calibration_manifest"] = str((calib_dir / f"{calibration_id}.json"))
+    return result
 
 
 @mcp.tool()
@@ -2522,6 +3215,223 @@ def start_from_dir(
             **_mpi_status_fields(num_procs, mpirun),
         },
     )
+
+
+@mcp.tool()
+def prepare_batch(
+    cases: list[dict],
+    batch_id: str | None = None,
+    overwrite: bool = False,
+    validate: bool = True,
+) -> dict:
+    """Prepare a batch of queued run directories without launching them.
+
+    Each case may provide one of:
+      - `input_script`: full deck text
+      - `template` plus `parameters`: render a `{{param}}` deck
+      - `case_type`: build a standard DEM case
+      - `advanced_template` / `template_type`: build an advanced scaffold
+    """
+    _ensure_write_allowed("prepare_batch")
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("cases must be a non-empty list")
+    max_cases = _max_batch_cases()
+    if len(cases) > max_cases:
+        raise ValueError(
+            f"batch has {len(cases)} cases; LIGGGHTS_MAX_BATCH_CASES is {max_cases}"
+        )
+    bid = _slugify(batch_id or f"batch_{uuid.uuid4().hex[:8]}", "batch")
+    bdir = _batch_dir(bid)
+    if bdir.exists() and any(bdir.iterdir()) and not overwrite:
+        raise RuntimeError(f"batch_id {bid} already exists; pass overwrite=True")
+    if bdir.exists() and overwrite:
+        shutil.rmtree(bdir)
+    bdir.mkdir(parents=True, exist_ok=True)
+
+    prepared: list[dict] = []
+    for index, spec in enumerate(cases, start=1):
+        deck, metadata = _deck_from_case_spec(spec, index)
+        _validate_deck_safety(deck)
+        validation = _estimate_deck(deck) if validate else None
+        if validation and validation["errors"]:
+            raise ValueError(
+                f"case {index} failed validation: " + "; ".join(validation["errors"])
+            )
+        run_id = _slugify(spec.get("name") or f"{bid}_{index:03d}", f"{bid}_{index:03d}")
+        wd = _prepare_run_dir(run_id, overwrite)
+        wd.mkdir(parents=True)
+        (wd / "input.in").write_text(deck)
+        case_meta = {
+            "batch_id": bid,
+            "case_index": index,
+            "run_id": run_id,
+            "name": spec.get("name"),
+            "metadata": metadata,
+            "validation": validation,
+        }
+        (wd / "batch_case.json").write_text(json.dumps(case_meta, indent=2))
+        status = {
+            "run_id": run_id,
+            "status": "queued",
+            "kind": "batch_case",
+            "batch_id": bid,
+            "case_index": index,
+            "created_at": _now_iso(),
+            "work_dir": str(wd),
+        }
+        if metadata.get("parameters"):
+            status["parameters"] = metadata["parameters"]
+        _write_status(wd, status)
+        prepared.append(
+            {
+                "run_id": run_id,
+                "case_index": index,
+                "status": "queued",
+                "work_dir": str(wd),
+                "source": metadata.get("source"),
+                "validation_ok": validation.get("ok") if validation else None,
+            }
+        )
+
+    manifest = {
+        "batch_id": bid,
+        "created_at": _now_iso(),
+        "case_count": len(prepared),
+        "cases": prepared,
+    }
+    _write_batch_manifest(bid, manifest)
+    return manifest
+
+
+@mcp.tool()
+def start_batch(
+    batch_id: str,
+    max_start: int | None = None,
+    num_procs: int = 1,
+    mpirun: str = "mpirun",
+) -> dict:
+    """Start queued cases from a prepared batch, respecting concurrency limits."""
+    _ensure_write_allowed("start_batch")
+    _validate_rank_count(num_procs, "num_procs")
+    manifest = _read_batch_manifest(batch_id)
+    queued: list[dict] = []
+    for case in manifest.get("cases", []):
+        run_id = case["run_id"]
+        status = check_status(run_id)
+        if status.get("status") == "queued":
+            queued.append(case)
+    if max_start is not None:
+        if max_start < 1:
+            raise ValueError("max_start must be >= 1")
+        queued = queued[:max_start]
+    max_runs = _max_concurrent_runs()
+    if max_runs is not None:
+        slots = max(0, max_runs - _running_run_count())
+        queued = queued[:slots]
+    if not queued:
+        return {
+            "batch_id": batch_id,
+            "started_count": 0,
+            "started": [],
+            "message": "no queued cases available or no concurrency slots",
+        }
+    _ensure_concurrency_capacity(len(queued))
+
+    started: list[dict] = []
+    for case in queued:
+        run_id = case["run_id"]
+        wd = _run_dir(run_id)
+        deck_path = wd / "input.in"
+        if not deck_path.is_file():
+            raise FileNotFoundError(f"batch case deck missing: {run_id}")
+        deck = deck_path.read_text()
+        _validate_deck_safety(deck)
+        cmd = _liggghts_cmd(["-in", "input.in"], num_procs, mpirun)
+        existing = _read_status(wd)
+        inherited = {
+            key: value
+            for key, value in existing.items()
+            if key
+            not in {
+                "status",
+                "pid",
+                "started_at",
+                "finished_at",
+                "exit_code",
+                "cmd",
+                "last_log",
+            }
+        }
+        status = _launch(
+            wd,
+            cmd,
+            run_id=run_id,
+            extra_status={
+                **inherited,
+                "kind": "batch_case",
+                "batch_id": batch_id,
+                "case_index": case.get("case_index"),
+                "num_procs": num_procs,
+                "mpi_ranks": num_procs,
+                **_mpi_status_fields(num_procs, mpirun),
+            },
+        )
+        started.append(status)
+    manifest["last_started_at"] = _now_iso()
+    _write_batch_manifest(batch_id, manifest)
+    return {"batch_id": batch_id, "started_count": len(started), "started": started}
+
+
+@mcp.tool()
+def batch_status(batch_id: str) -> dict:
+    """Summarize status for all cases in a prepared batch."""
+    manifest = _read_batch_manifest(batch_id)
+    cases: list[dict] = []
+    counts: dict[str, int] = {}
+    for case in manifest.get("cases", []):
+        run_id = case["run_id"]
+        status = check_status(run_id)
+        state = status.get("status", "unknown")
+        counts[state] = counts.get(state, 0) + 1
+        cases.append(
+            {
+                "run_id": run_id,
+                "case_index": case.get("case_index"),
+                "status": state,
+                "exit_code": status.get("exit_code"),
+                "last_log": status.get("last_log", ""),
+            }
+        )
+    return {
+        "batch_id": batch_id,
+        "case_count": len(cases),
+        "counts": counts,
+        "cases": cases,
+    }
+
+
+@mcp.tool()
+def list_batches() -> list[dict]:
+    """List known batch manifests."""
+    root = RUNS / "_batches"
+    if not root.is_dir():
+        return []
+    out: list[dict] = []
+    for path in sorted(root.iterdir()):
+        if not path.is_dir():
+            continue
+        manifest = _read_json_file(path / "batch.json")
+        if not manifest:
+            continue
+        out.append(
+            {
+                "batch_id": manifest.get("batch_id", path.name),
+                "case_count": manifest.get("case_count"),
+                "created_at": manifest.get("created_at"),
+                "last_started_at": manifest.get("last_started_at"),
+            }
+        )
+    return out
 
 
 @mcp.tool()
@@ -3081,6 +3991,135 @@ def compare_runs(run_ids: list[str]) -> list[dict]:
     ]
 
 
+@mcp.tool()
+def evaluate_calibration(
+    run_ids: list[str],
+    targets: dict,
+    analyze_dumps: bool = False,
+    missing_penalty: float = 1.0e6,
+    calibration_id: str | None = None,
+    write_report: bool = True,
+) -> dict:
+    """Score completed runs against calibration targets.
+
+    Target keys are dotted paths inside the assembled run data, e.g.
+    `summary.log.last_thermo.Atoms` or
+    `dump_metrics.last_frame.particle_bbox_solid_fraction`.
+
+    Target values may be numbers or dicts:
+    `{"target": 0.55, "tolerance": 0.05, "weight": 2.0}`.
+    Lower scores are better.
+    """
+    if not run_ids:
+        raise ValueError("run_ids must not be empty")
+    if not targets:
+        raise ValueError("targets must not be empty")
+    if missing_penalty < 0:
+        raise ValueError("missing_penalty must be >= 0")
+    for spec in targets.values():
+        _target_spec(spec)
+
+    evaluations: list[dict] = []
+    for run_id in run_ids:
+        summary = summarize_run(run_id, max_outputs=50)
+        status = check_status(run_id)
+        dump_metrics = None
+        metrics_error = None
+        if analyze_dumps:
+            try:
+                dump_metrics = analyze_dump_metrics(run_id, write_files=False)
+            except (FileNotFoundError, ValueError) as e:
+                metrics_error = str(e)
+        else:
+            dump_metrics = _latest_analysis_metrics(run_id)
+        data = {
+            "run_id": run_id,
+            "summary": summary,
+            "status": status,
+            "dump_metrics": dump_metrics,
+            "parameters": status.get("parameters", {}),
+        }
+        score, metric_results = _calibration_score(data, targets, missing_penalty)
+        evaluations.append(
+            {
+                "run_id": run_id,
+                "score": score,
+                "metrics": metric_results,
+                "parameters": status.get("parameters", {}),
+                "status": summary.get("status"),
+                "exit_code": summary.get("exit_code"),
+                "dump_metrics_error": metrics_error,
+            }
+        )
+    evaluations.sort(key=lambda item: item["score"])
+    cid = _slugify(calibration_id or f"calibration_{uuid.uuid4().hex[:8]}", "calibration")
+    result = {
+        "calibration_id": cid,
+        "targets": targets,
+        "run_count": len(evaluations),
+        "best_run_id": evaluations[0]["run_id"] if evaluations else None,
+        "best_score": evaluations[0]["score"] if evaluations else None,
+        "evaluations": evaluations,
+        "created_at": _now_iso(),
+    }
+    if write_report:
+        _ensure_write_allowed("evaluate_calibration")
+        path = _calibration_dir() / f"{cid}_evaluation.json"
+        path.write_text(json.dumps(result, indent=2))
+        result["report_path"] = str(path)
+    return result
+
+
+@mcp.tool()
+def suggest_calibration_cases(
+    best_parameters: dict,
+    parameter_bounds: dict | None = None,
+    relative_step: float = 0.25,
+    include_center: bool = True,
+    max_cases: int = 17,
+    name_prefix: str = "calib_next",
+    template: str | None = None,
+    prepare_as_batch: bool = False,
+    batch_id: str | None = None,
+    overwrite: bool = False,
+) -> dict:
+    """Suggest next-round calibration parameter cases around a current best point.
+
+    When `template` is provided and `prepare_as_batch=True`, this also renders
+    one queued batch case per suggestion using `{{param}}` substitutions.
+    """
+    suggestions = _calibration_suggestions(
+        best_parameters,
+        parameter_bounds,
+        relative_step,
+        include_center,
+        max_cases,
+    )
+    for index, suggestion in enumerate(suggestions, start=1):
+        suggestion["name"] = _slugify(f"{name_prefix}_{index:03d}", f"{name_prefix}_{index:03d}")
+    result = {
+        "suggestion_count": len(suggestions),
+        "suggestions": suggestions,
+    }
+    if prepare_as_batch:
+        if not template:
+            raise ValueError("prepare_as_batch=True requires template")
+        cases = [
+            {
+                "name": suggestion["name"],
+                "template": template,
+                "parameters": suggestion["parameters"],
+            }
+            for suggestion in suggestions
+        ]
+        result["batch"] = prepare_batch(
+            cases,
+            batch_id=batch_id or _slugify(name_prefix, "calib_next"),
+            overwrite=overwrite,
+        )
+    return result
+
+
 def _insert_before_run_command(input_script: str, snippet_lines: list[str]) -> str:
     lines = input_script.rstrip().splitlines()
     insert_at = len(lines)
@@ -3572,6 +4611,7 @@ def config_resource() -> dict:
         "max_ranks": _env_int("LIGGGHTS_MAX_RANKS"),
         "max_concurrent_runs": _max_concurrent_runs(),
         "max_sweep_cases": _max_sweep_cases(),
+        "max_batch_cases": _max_batch_cases(),
         "max_read_bytes": _max_read_bytes(),
         "max_analysis_bytes": _max_analysis_bytes(),
         "visualization_timeout": _vis_timeout(),
@@ -3621,6 +4661,8 @@ def list_runs() -> list[dict]:
     out = []
     for wd in sorted(RUNS.iterdir()):
         if not wd.is_dir():
+            continue
+        if wd.name in {"_batches", "_calibrations"} or wd.name.startswith("."):
             continue
         status = _read_status(wd)
         if status:

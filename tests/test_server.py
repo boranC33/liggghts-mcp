@@ -25,6 +25,7 @@ class ServerTestCase(unittest.TestCase):
                 "LIGGGHTS_MAX_CONCURRENT_RUNS",
                 "LIGGGHTS_ALLOWED_CASE_ROOTS",
                 "LIGGGHTS_MAX_SWEEP_CASES",
+                "LIGGGHTS_MAX_BATCH_CASES",
                 "LIGGGHTS_MAX_READ_BYTES",
                 "LIGGGHTS_MAX_ANALYSIS_BYTES",
                 "LIGGGHTS_ALLOW_DECK_SHELL",
@@ -558,6 +559,104 @@ class ServerTestCase(unittest.TestCase):
         report = (wd / "reports" / "report.json").read_text()
         self.assertIn('"dump_metrics"', report)
         self.assertIn("LIGGGHTS Run Report", (wd / "reports" / "report.md").read_text())
+
+    def test_create_advanced_dem_template_chute_and_drum(self):
+        chute = server.create_advanced_dem_template(
+            template_type="inclined_chute",
+            particle_count=10,
+            run_steps=0,
+            settle_steps=0,
+            options={"angle_deg": 30},
+            write_case=False,
+            start=False,
+        )
+
+        self.assertEqual(chute["template_type"], "inclined_chute")
+        self.assertIn("# chute_angle_deg 30", chute["deck"])
+        self.assertIn("fix             mcp_gravity all gravity 9.81 vector", chute["deck"])
+        self.assertTrue(chute["validation"]["ok"])
+
+        drum = server.create_advanced_dem_template(
+            template_type="rotating_drum",
+            particle_count=10,
+            run_steps=0,
+            settle_steps=0,
+            write_case=False,
+            start=False,
+        )
+        self.assertIn("zcylinder", drum["deck"])
+        self.assertTrue(drum["metadata"]["warnings"])
+
+    def test_prepare_start_and_summarize_batch(self):
+        self._fake_liggghts()
+        cases = [
+            {"name": "batch_a", "input_script": self._minimal_deck()},
+            {"name": "batch_b", "case_type": "box_settle", "particle_count": 4, "run_steps": 0, "settle_steps": 0},
+        ]
+
+        prepared = server.prepare_batch(cases, batch_id="batch1")
+        self.assertEqual(prepared["case_count"], 2)
+        self.assertEqual(server.check_status("batch_a")["status"], "queued")
+
+        started = server.start_batch("batch1", max_start=2)
+        self.assertEqual(started["started_count"], 2)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = server.batch_status("batch1")
+            if status["counts"].get("finished") == 2:
+                break
+            time.sleep(0.01)
+        status = server.batch_status("batch1")
+        self.assertEqual(status["counts"].get("finished"), 2)
+        self.assertEqual(server.list_batches()[0]["batch_id"], "batch1")
+        self.assertNotIn("_batches", {item["run_id"] for item in server.list_runs()})
+
+    def test_calibration_evaluation_and_suggestions(self):
+        for run_id, value, friction in (
+            ("calib_a", 0.40, 0.2),
+            ("calib_b", 0.54, 0.5),
+        ):
+            wd = self._run_dir(run_id)
+            (wd / "status.json").write_text(
+                '{"run_id":"%s","status":"finished","exit_code":0,'
+                '"parameters":{"friction":%s},'
+                '"started_at":"2026-01-01T00:00:00+00:00",'
+                '"finished_at":"2026-01-01T00:00:01+00:00"}'
+                % (run_id, friction)
+            )
+            (wd / "log.run").write_text(
+                "Step Atoms Temp\n"
+                "0 10 0.0\n"
+                "Loop time of 0.1 on 1 procs for 0 steps with 10 atoms\n"
+            )
+            analysis = wd / "analysis"
+            analysis.mkdir()
+            (analysis / "particles_metrics.json").write_text(
+                '{"last_frame":{"particle_bbox_solid_fraction":%s}}' % value
+            )
+
+        result = server.evaluate_calibration(
+            ["calib_a", "calib_b"],
+            {
+                "dump_metrics.last_frame.particle_bbox_solid_fraction": {
+                    "target": 0.55,
+                    "tolerance": 0.05,
+                }
+            },
+            calibration_id="calib_eval",
+        )
+
+        self.assertEqual(result["best_run_id"], "calib_b")
+        self.assertTrue((server.RUNS / "_calibrations" / "calib_eval_evaluation.json").exists())
+
+        suggestions = server.suggest_calibration_cases(
+            {"friction": 0.5},
+            parameter_bounds={"friction": [0.1, 0.9]},
+            relative_step=0.25,
+            max_cases=3,
+        )
+        self.assertEqual(suggestions["suggestion_count"], 3)
+        self.assertEqual(suggestions["suggestions"][0]["parameters"], {"friction": 0.5})
 
     def test_stop_simulation_uses_sigkill_for_stubborn_process_group(self):
         wd = self._run_dir("stubborn")
