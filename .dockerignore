@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+*.egg-info
+.pytest_cache
+liggghts_runs
+log.liggghts
+lib/*.so
+lib/*.so.*
