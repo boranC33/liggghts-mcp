@@ -1,11 +1,15 @@
 """LIGGGHTS MCP server — start runs, poll status, read logs, list outputs."""
 from mcp.server.fastmcp import FastMCP
+import csv
+import hashlib
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import tempfile
 import time
@@ -16,7 +20,7 @@ from pathlib import Path
 
 mcp = FastMCP("liggghts")
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 LIGGGHTS_BIN = os.environ.get("LIGGGHTS_BIN", "/usr/local/bin/liggghts")
 RUNS = Path(os.environ.get("LIGGGHTS_RUNS", Path.home() / "liggghts_runs"))
@@ -139,6 +143,13 @@ def _max_read_bytes() -> int:
     value = _env_int("LIGGGHTS_MAX_READ_BYTES", 256 * 1024)
     if value is None or value < 1:
         raise ValueError("LIGGGHTS_MAX_READ_BYTES must be >= 1")
+    return value
+
+
+def _max_analysis_bytes() -> int:
+    value = _env_int("LIGGGHTS_MAX_ANALYSIS_BYTES", 32 * 1024 * 1024)
+    if value is None or value < 1:
+        raise ValueError("LIGGGHTS_MAX_ANALYSIS_BYTES must be >= 1")
     return value
 
 
@@ -518,6 +529,904 @@ def _estimate_deck(input_script: str, num_procs: int = 1) -> dict:
         "warnings": warnings,
         "ok": not findings["errors"],
     }
+
+
+def _fmt(value: float | int) -> str:
+    if isinstance(value, int):
+        return str(value)
+    return f"{value:.12g}"
+
+
+def _positive_float(value: float, name: str) -> float:
+    value = float(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return value
+
+
+def _nonnegative_int(value: int, name: str) -> int:
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return value
+
+
+def _box_from_domain(
+    domain: dict | None,
+    *,
+    particle_count: int,
+    particle_diameter_m: float,
+    case_type: str,
+) -> dict:
+    domain = domain or {}
+    d = particle_diameter_m
+    particle_count = max(1, particle_count)
+    base = max(20.0 * d, (particle_count ** (1.0 / 3.0)) * d * 4.0)
+    if case_type == "silo_discharge":
+        width = float(domain.get("width_m", max(base, 16.0 * d)))
+        depth = float(domain.get("depth_m", width))
+        height = float(domain.get("height_m", max(3.0 * width, 50.0 * d)))
+    else:
+        width = float(domain.get("width_m", max(base, 20.0 * d)))
+        depth = float(domain.get("depth_m", width))
+        height = float(domain.get("height_m", max(1.8 * width, 35.0 * d)))
+    if width <= 0 or depth <= 0 or height <= 0:
+        raise ValueError("domain width_m/depth_m/height_m must be > 0")
+    return {
+        "xlo": -width / 2.0,
+        "xhi": width / 2.0,
+        "ylo": -depth / 2.0,
+        "yhi": depth / 2.0,
+        "zlo": 0.0,
+        "zhi": height,
+        "width_m": width,
+        "depth_m": depth,
+        "height_m": height,
+    }
+
+
+def _material_defaults(material: dict | None) -> dict:
+    material = material or {}
+    return {
+        "youngs_modulus_pa": float(material.get("youngs_modulus_pa", 5.0e6)),
+        "poissons_ratio": float(material.get("poissons_ratio", 0.45)),
+        "coefficient_restitution": float(material.get("coefficient_restitution", 0.3)),
+        "coefficient_friction": float(material.get("coefficient_friction", 0.5)),
+    }
+
+
+def _dem_material_lines(material: dict) -> list[str]:
+    return [
+        f"fix             mcp_mat_young all property/global youngsModulus peratomtype {_fmt(material['youngs_modulus_pa'])}",
+        f"fix             mcp_mat_poisson all property/global poissonsRatio peratomtype {_fmt(material['poissons_ratio'])}",
+        f"fix             mcp_mat_restitution all property/global coefficientRestitution peratomtypepair 1 {_fmt(material['coefficient_restitution'])}",
+        f"fix             mcp_mat_friction all property/global coefficientFriction peratomtypepair 1 {_fmt(material['coefficient_friction'])}",
+    ]
+
+
+def _build_dem_case_deck(
+    *,
+    case_type: str,
+    particle_count: int,
+    particle_diameter_m: float,
+    material_density_kg_m3: float,
+    material: dict | None,
+    domain: dict | None,
+    run_steps: int,
+    settle_steps: int,
+    timestep_s: float,
+    dump_every: int,
+) -> tuple[str, dict]:
+    particle_count = int(particle_count)
+    if particle_count < 1:
+        raise ValueError("particle_count must be >= 1")
+    particle_diameter_m = _positive_float(particle_diameter_m, "particle_diameter_m")
+    material_density_kg_m3 = _positive_float(
+        material_density_kg_m3, "material_density_kg_m3"
+    )
+    timestep_s = _positive_float(timestep_s, "timestep_s")
+    run_steps = _nonnegative_int(run_steps, "run_steps")
+    settle_steps = _nonnegative_int(settle_steps, "settle_steps")
+    dump_every = int(dump_every)
+    if dump_every < 1:
+        raise ValueError("dump_every must be >= 1")
+    case_type = case_type.strip().lower()
+    aliases = {
+        "angle": "angle_of_repose",
+        "repose": "angle_of_repose",
+        "box": "box_settle",
+        "settle": "box_settle",
+        "silo": "silo_discharge",
+    }
+    case_type = aliases.get(case_type, case_type)
+    if case_type not in {"angle_of_repose", "box_settle", "silo_discharge"}:
+        raise ValueError(
+            "case_type must be one of: angle_of_repose, box_settle, silo_discharge"
+        )
+
+    box = _box_from_domain(
+        domain,
+        particle_count=particle_count,
+        particle_diameter_m=particle_diameter_m,
+        case_type=case_type,
+    )
+    mat = _material_defaults(material)
+    radius = particle_diameter_m / 2.0
+    insert_margin = max(2.5 * particle_diameter_m, 0.04 * box["width_m"])
+    insert_x = max(radius, box["width_m"] / 2.0 - insert_margin)
+    insert_y = max(radius, box["depth_m"] / 2.0 - insert_margin)
+    insert_zlo = min(box["zhi"] - 3.0 * radius, max(3.0 * radius, 0.18 * box["height_m"]))
+    insert_zhi = max(insert_zlo + 3.0 * radius, 0.92 * box["height_m"])
+    insert_zhi = min(insert_zhi, box["zhi"] - radius)
+    if insert_zhi <= insert_zlo:
+        insert_zlo = max(radius, box["zlo"] + 3.0 * radius)
+        insert_zhi = min(box["zhi"] - radius, insert_zlo + 8.0 * radius)
+
+    base_lines = [
+        "# Generated by liggghts-mcp create_dem_case",
+        f"# case_type {case_type}",
+        "units           si",
+        "atom_style      granular",
+        "atom_modify     map array",
+        "boundary        f f f",
+        "newton          off",
+        "communicate     single vel yes",
+        "",
+        (
+            "region          mcp_domain block "
+            f"{_fmt(box['xlo'])} {_fmt(box['xhi'])} "
+            f"{_fmt(box['ylo'])} {_fmt(box['yhi'])} "
+            f"{_fmt(box['zlo'])} {_fmt(box['zhi'])} units box"
+        ),
+        "create_box      1 mcp_domain",
+        "",
+        f"neighbor        {_fmt(max(radius * 0.4, 1.0e-6))} bin",
+        "neigh_modify    delay 0",
+        "",
+        *_dem_material_lines(mat),
+        "",
+        "pair_style      gran model hertz tangential history",
+        "pair_coeff      * *",
+        "",
+        f"timestep        {_fmt(timestep_s)}",
+        "fix             mcp_gravity all gravity 9.81 vector 0.0 0.0 -1.0",
+        "fix             mcp_integrate all nve/sphere",
+        "",
+    ]
+
+    wall_lines: list[str]
+    insertion_lines: list[str]
+    phase_lines: list[str]
+    warnings: list[str] = []
+
+    if case_type == "angle_of_repose":
+        wall_lines = [
+            "fix             mcp_floor all wall/gran model hertz tangential history primitive type 1 zplane 0.0",
+        ]
+        insertion_lines = [
+            f"fix             mcp_template all particletemplate/sphere 15485863 atom_type 1 density constant {_fmt(material_density_kg_m3)} radius constant {_fmt(radius)}",
+            "fix             mcp_distribution all particledistribution/discrete 15485867 1 mcp_template 1.0",
+            (
+                "region          mcp_insert block "
+                f"{_fmt(-insert_x)} {_fmt(insert_x)} "
+                f"{_fmt(-insert_y)} {_fmt(insert_y)} "
+                f"{_fmt(insert_zlo)} {_fmt(insert_zhi)} units box"
+            ),
+            (
+                "fix             mcp_insert all insert/pack seed 32452843 "
+                "distributiontemplate mcp_distribution vel constant 0.0 0.0 0.0 "
+                f"insert_every 100 overlapcheck yes all_in yes particles_in_region {particle_count} region mcp_insert"
+            ),
+        ]
+        phase_lines = [
+            f"run             {settle_steps}",
+            "unfix           mcp_insert",
+            f"run             {run_steps}",
+        ]
+    elif case_type == "box_settle":
+        wall_lines = [
+            f"fix             mcp_xlo all wall/gran model hertz tangential history primitive type 1 xplane {_fmt(box['xlo'])}",
+            f"fix             mcp_xhi all wall/gran model hertz tangential history primitive type 1 xplane {_fmt(box['xhi'])}",
+            f"fix             mcp_ylo all wall/gran model hertz tangential history primitive type 1 yplane {_fmt(box['ylo'])}",
+            f"fix             mcp_yhi all wall/gran model hertz tangential history primitive type 1 yplane {_fmt(box['yhi'])}",
+            "fix             mcp_floor all wall/gran model hertz tangential history primitive type 1 zplane 0.0",
+        ]
+        insertion_lines = [
+            f"fix             mcp_template all particletemplate/sphere 15485863 atom_type 1 density constant {_fmt(material_density_kg_m3)} radius constant {_fmt(radius)}",
+            "fix             mcp_distribution all particledistribution/discrete 15485867 1 mcp_template 1.0",
+            (
+                "region          mcp_insert block "
+                f"{_fmt(-insert_x)} {_fmt(insert_x)} "
+                f"{_fmt(-insert_y)} {_fmt(insert_y)} "
+                f"{_fmt(insert_zlo)} {_fmt(insert_zhi)} units box"
+            ),
+            (
+                "fix             mcp_insert all insert/pack seed 32452843 "
+                "distributiontemplate mcp_distribution vel constant 0.0 0.0 0.0 "
+                f"insert_every 100 overlapcheck yes all_in yes particles_in_region {particle_count} region mcp_insert"
+            ),
+        ]
+        phase_lines = [
+            f"run             {settle_steps}",
+            "unfix           mcp_insert",
+            f"run             {run_steps}",
+        ]
+    else:
+        radius_wall = min(box["width_m"], box["depth_m"]) * 0.45
+        wall_lines = [
+            f"fix             mcp_silo_wall all wall/gran model hertz tangential history primitive type 1 zcylinder {_fmt(radius_wall)}",
+            "fix             mcp_bottom all wall/gran model hertz tangential history primitive type 1 zplane 0.0",
+        ]
+        insertion_lines = [
+            f"fix             mcp_template all particletemplate/sphere 15485863 atom_type 1 density constant {_fmt(material_density_kg_m3)} radius constant {_fmt(radius)}",
+            "fix             mcp_distribution all particledistribution/discrete 15485867 1 mcp_template 1.0",
+            (
+                "region          mcp_insert cylinder z 0.0 0.0 "
+                f"{_fmt(radius_wall * 0.8)} {_fmt(insert_zlo)} {_fmt(insert_zhi)} units box"
+            ),
+            (
+                "fix             mcp_insert all insert/pack seed 32452843 "
+                "distributiontemplate mcp_distribution vel constant 0.0 0.0 0.0 "
+                f"insert_every 100 overlapcheck yes all_in yes particles_in_region {particle_count} region mcp_insert"
+            ),
+        ]
+        phase_lines = [
+            f"run             {settle_steps}",
+            "unfix           mcp_insert",
+            "# Open the full bottom for a simple discharge starter case.",
+            "# For a real orifice, replace this primitive wall setup with a mesh wall.",
+            "unfix           mcp_bottom",
+            f"run             {run_steps}",
+        ]
+        warnings.append(
+            "silo_discharge uses a primitive cylindrical wall and opens the full bottom; "
+            "use mesh walls for a real orifice geometry"
+        )
+
+    output_lines = [
+        f"thermo          {dump_every}",
+        "thermo_style    custom step atoms ke",
+        (
+            f"dump            mcp_dump all custom {dump_every} particles.lammpstrj "
+            "id type x y z vx vy vz radius"
+        ),
+        "dump_modify     mcp_dump sort id",
+        f"restart         {max(dump_every, 1) * 10} restart.*.liggghts",
+        "",
+    ]
+
+    deck = "\n".join(
+        base_lines + wall_lines + [""] + insertion_lines + [""] + output_lines + phase_lines
+    ).rstrip() + "\n"
+    metadata = {
+        "case_type": case_type,
+        "particle_count": particle_count,
+        "particle_diameter_m": particle_diameter_m,
+        "particle_radius_m": radius,
+        "material_density_kg_m3": material_density_kg_m3,
+        "material": mat,
+        "domain": box,
+        "run_steps": run_steps,
+        "settle_steps": settle_steps,
+        "timestep_s": timestep_s,
+        "dump_every": dump_every,
+        "warnings": warnings,
+    }
+    return deck, metadata
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _asset_record(path: Path, root: Path, *, hash_file: bool = True) -> dict:
+    record = _file_record(path, root)
+    if hash_file:
+        record["sha256"] = _sha256_file(path)
+    return record
+
+
+def _resolve_case_relpath(root: Path, deck_dir: Path, relpath: str) -> Path:
+    p = Path(relpath)
+    if p.is_absolute():
+        return p.expanduser().resolve()
+    return (deck_dir / p).resolve()
+
+
+def _deck_asset_refs(input_script: str) -> list[dict]:
+    refs: list[dict] = []
+    for lineno, raw in enumerate(input_script.splitlines(), start=1):
+        code = _deck_code_line(raw)
+        if not code:
+            continue
+        try:
+            parts = shlex.split(code, comments=False, posix=True)
+        except ValueError:
+            parts = code.split()
+        if not parts:
+            continue
+        cmd = parts[0].lower()
+        if cmd == "include" and len(parts) >= 2:
+            refs.append({"line": lineno, "kind": "include", "path": parts[1], "required": True})
+        elif cmd == "jump" and len(parts) >= 2 and parts[1].upper() != "SELF":
+            refs.append({"line": lineno, "kind": "jump", "path": parts[1], "required": True})
+        elif cmd == "read_data" and len(parts) >= 2:
+            refs.append({"line": lineno, "kind": "read_data", "path": parts[1], "required": True})
+        elif cmd == "read_restart" and len(parts) >= 2:
+            refs.append({"line": lineno, "kind": "read_restart", "path": parts[1], "required": True})
+        elif cmd == "fix" and any("mesh/surface" in part.lower() for part in parts):
+            for idx, part in enumerate(parts[:-1]):
+                if part.lower() == "file":
+                    refs.append(
+                        {
+                            "line": lineno,
+                            "kind": "mesh_file",
+                            "path": parts[idx + 1],
+                            "required": True,
+                        }
+                    )
+        elif cmd in {"write_restart", "write_data"} and len(parts) >= 2:
+            refs.append({"line": lineno, "kind": cmd, "path": parts[1], "required": False})
+        elif cmd == "dump" and len(parts) >= 6:
+            refs.append({"line": lineno, "kind": "dump_output", "path": parts[5], "required": False})
+        elif cmd == "restart" and len(parts) >= 3:
+            refs.append({"line": lineno, "kind": "restart_output", "path": parts[2], "required": False})
+    return refs
+
+
+def _bounds_record(mins: list[float], maxs: list[float]) -> dict | None:
+    if any(math.isinf(v) for v in mins + maxs):
+        return None
+    return {
+        "x": [mins[0], maxs[0]],
+        "y": [mins[1], maxs[1]],
+        "z": [mins[2], maxs[2]],
+        "size": [maxs[i] - mins[i] for i in range(3)],
+    }
+
+
+def _update_bounds(mins: list[float], maxs: list[float], x: float, y: float, z: float) -> None:
+    values = [x, y, z]
+    for idx, value in enumerate(values):
+        mins[idx] = min(mins[idx], value)
+        maxs[idx] = max(maxs[idx], value)
+
+
+def _inspect_ascii_stl(path: Path, text: str) -> dict:
+    mins = [math.inf, math.inf, math.inf]
+    maxs = [-math.inf, -math.inf, -math.inf]
+    vertex_count = 0
+    facet_count = 0
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if parts[0].lower() == "facet":
+            facet_count += 1
+        if parts[0].lower() == "vertex" and len(parts) >= 4:
+            try:
+                x, y, z = (float(parts[1]), float(parts[2]), float(parts[3]))
+            except ValueError:
+                continue
+            vertex_count += 1
+            _update_bounds(mins, maxs, x, y, z)
+    return {
+        "format": "ascii_stl",
+        "facet_count": facet_count,
+        "vertex_count": vertex_count,
+        "bounds": _bounds_record(mins, maxs),
+        "warnings": [] if vertex_count else ["no ASCII STL vertices found"],
+    }
+
+
+def _inspect_binary_stl(path: Path) -> dict:
+    warnings: list[str] = []
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        header = f.read(80)
+        count_raw = f.read(4)
+        if len(count_raw) != 4:
+            return {"format": "binary_stl", "facet_count": 0, "bounds": None, "warnings": ["truncated STL header"]}
+        tri_count = struct.unpack("<I", count_raw)[0]
+        expected = 84 + tri_count * 50
+        if expected != size:
+            warnings.append(f"binary STL size mismatch: expected {expected} bytes, got {size}")
+        mins = [math.inf, math.inf, math.inf]
+        maxs = [-math.inf, -math.inf, -math.inf]
+        read_tris = 0
+        for _ in range(tri_count):
+            rec = f.read(50)
+            if len(rec) < 50:
+                warnings.append("binary STL triangle records are truncated")
+                break
+            values = struct.unpack("<12fH", rec)
+            coords = values[3:12]
+            for idx in range(0, 9, 3):
+                _update_bounds(mins, maxs, coords[idx], coords[idx + 1], coords[idx + 2])
+            read_tris += 1
+    return {
+        "format": "binary_stl",
+        "facet_count": read_tris,
+        "bounds": _bounds_record(mins, maxs),
+        "warnings": warnings,
+    }
+
+
+def _inspect_obj(path: Path) -> dict:
+    mins = [math.inf, math.inf, math.inf]
+    maxs = [-math.inf, -math.inf, -math.inf]
+    vertex_count = 0
+    face_count = 0
+    warnings: list[str] = []
+    with path.open("r", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            if parts[0] == "v" and len(parts) >= 4:
+                try:
+                    x, y, z = (float(parts[1]), float(parts[2]), float(parts[3]))
+                except ValueError:
+                    continue
+                vertex_count += 1
+                _update_bounds(mins, maxs, x, y, z)
+            elif parts[0] == "f":
+                face_count += 1
+    if vertex_count == 0:
+        warnings.append("no OBJ vertices found")
+    return {
+        "format": "obj",
+        "vertex_count": vertex_count,
+        "face_count": face_count,
+        "bounds": _bounds_record(mins, maxs),
+        "warnings": warnings,
+    }
+
+
+def _inspect_mesh_file(path: Path) -> dict | None:
+    suffix = path.suffix.lower()
+    if suffix == ".stl":
+        with path.open("rb") as f:
+            sample = f.read(4096)
+        try:
+            text = sample.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return _inspect_binary_stl(path)
+        if text.lstrip().lower().startswith("solid") and b"\0" not in sample:
+            return _inspect_ascii_stl(path, path.read_text(errors="replace"))
+        return _inspect_binary_stl(path)
+    if suffix == ".obj":
+        return _inspect_obj(path)
+    return None
+
+
+_CASE_ASSET_PATTERNS = (
+    "*.in",
+    "*.liggghts",
+    "*.lmp",
+    "*.data",
+    "*.restart",
+    "*.stl",
+    "*.obj",
+    "*.vtk",
+    "*.vtp",
+    "*.vtu",
+    "*.mesh",
+    "*.msh",
+)
+
+
+def _discover_case_assets(root: Path) -> list[Path]:
+    seen: set[Path] = set()
+    for pattern in _CASE_ASSET_PATTERNS:
+        for path in root.glob(f"**/{pattern}"):
+            if path.is_file() and _stays_inside(path, root):
+                seen.add(path.resolve())
+    return sorted(seen)
+
+
+def _choose_restart_relpath(source_run_id: str, restart_relpath: str | None) -> str:
+    if restart_relpath is not None:
+        path = _resolve_run_path(source_run_id, restart_relpath)
+        if not path.is_file():
+            raise FileNotFoundError(f"restart not found: {restart_relpath}")
+        return str(_validate_relpath(restart_relpath, "restart_relpath"))
+    records = list_output_details(source_run_id, patterns=["*.restart", "*.liggghts", "restart*"])
+    restart_records = [
+        record
+        for record in records
+        if record["kind"] == "restart" or "restart" in Path(record["relpath"]).name.lower()
+    ]
+    if not restart_records:
+        raise FileNotFoundError(f"no restart files found in run {source_run_id}")
+    restart_records.sort(key=lambda rec: Path(rec["path"]).stat().st_mtime, reverse=True)
+    return restart_records[0]["relpath"]
+
+
+def _copy_run_tree_for_resume(src: Path, dst: Path, restart_relpath: str) -> None:
+    restart_rel = _validate_relpath(restart_relpath, "restart_relpath")
+
+    def ignore(_dir: str, names: list[str]) -> set[str]:
+        ignored = set()
+        for name in names:
+            lower = name.lower()
+            suffix = Path(name).suffix.lower()
+            if name in (_BOOKKEEPING_FILES - {"input.in"}):
+                ignored.add(name)
+            elif lower.startswith("log.") or lower.startswith("screen."):
+                ignored.add(name)
+            elif suffix in {
+                ".dump",
+                ".lammpstrj",
+                ".vtk",
+                ".vtp",
+                ".vtu",
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".mp4",
+                ".avi",
+                ".mov",
+            }:
+                ignored.add(name)
+            elif suffix == ".restart" or "restart" in lower:
+                ignored.add(name)
+            elif name in {"post", "converted", "visualization", "artifacts", "reports", "analysis"}:
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(src, dst, ignore=ignore, symlinks=True)
+    selected_src = src / restart_rel
+    selected_dst = dst / restart_rel
+    selected_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(selected_src, selected_dst)
+
+
+def _running_stat_summary(count: int, total: float, min_value: float | None, max_value: float | None) -> dict | None:
+    if count < 1 or min_value is None or max_value is None:
+        return None
+    return {"count": count, "min": min_value, "max": max_value, "mean": total / count}
+
+
+def _dump_coord(row: dict[str, float], axis: str, bounds: dict[str, list[float]] | None) -> float | None:
+    for key in (axis, axis + "u"):
+        if key in row:
+            return row[key]
+    scaled_key = axis + "s"
+    if scaled_key in row and bounds and axis in bounds:
+        lo, hi = bounds[axis]
+        return lo + row[scaled_key] * (hi - lo)
+    return None
+
+
+def _parse_dump_metrics(path: Path, *, max_frames: int, max_bytes: int) -> dict:
+    if max_frames < 1:
+        raise ValueError("max_frames must be >= 1")
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be >= 1")
+
+    frames: list[dict] = []
+    bytes_read = 0
+    truncated_by_bytes = False
+    truncated_by_frames = False
+
+    def read_line(f) -> str | None:
+        nonlocal bytes_read, truncated_by_bytes
+        line = f.readline()
+        if line == "":
+            return None
+        bytes_read += len(line.encode("utf-8", errors="replace"))
+        if bytes_read > max_bytes:
+            truncated_by_bytes = True
+            return None
+        return line.rstrip("\n")
+
+    with path.open("r", errors="replace") as f:
+        while True:
+            line = read_line(f)
+            if line is None:
+                break
+            if not line.startswith("ITEM: TIMESTEP"):
+                continue
+            if len(frames) >= max_frames:
+                truncated_by_frames = True
+                break
+            timestep_line = read_line(f)
+            if timestep_line is None:
+                break
+            try:
+                timestep = int(float(timestep_line.strip()))
+            except ValueError:
+                timestep = timestep_line.strip()
+
+            atom_count_expected: int | None = None
+            bounds: dict[str, list[float]] | None = None
+            atom_header: list[str] | None = None
+            atom_rows: list[list[str]] = []
+
+            while True:
+                item = read_line(f)
+                if item is None:
+                    break
+                if item.startswith("ITEM: NUMBER OF ATOMS"):
+                    value = read_line(f)
+                    if value is None:
+                        break
+                    try:
+                        atom_count_expected = int(float(value.strip()))
+                    except ValueError:
+                        atom_count_expected = None
+                elif item.startswith("ITEM: BOX BOUNDS"):
+                    axis_bounds: dict[str, list[float]] = {}
+                    for axis in ("x", "y", "z"):
+                        bound_line = read_line(f)
+                        if bound_line is None:
+                            break
+                        parts = bound_line.split()
+                        if len(parts) >= 2:
+                            try:
+                                axis_bounds[axis] = [float(parts[0]), float(parts[1])]
+                            except ValueError:
+                                pass
+                    bounds = axis_bounds or None
+                elif item.startswith("ITEM: ATOMS"):
+                    atom_header = item.split()[2:]
+                    rows_to_read = atom_count_expected or 0
+                    for _ in range(rows_to_read):
+                        row = read_line(f)
+                        if row is None:
+                            break
+                        atom_rows.append(row.split())
+                    break
+                elif item.startswith("ITEM: TIMESTEP"):
+                    break
+
+            if not atom_header:
+                frames.append(
+                    {
+                        "timestep": timestep,
+                        "atom_count": atom_count_expected,
+                        "bounds": bounds,
+                        "warnings": ["frame has no ATOMS section"],
+                    }
+                )
+                continue
+
+            mins = [math.inf, math.inf, math.inf]
+            maxs = [-math.inf, -math.inf, -math.inf]
+            pos_sum = [0.0, 0.0, 0.0]
+            pos_count = 0
+            speed_count = 0
+            speed_total = 0.0
+            speed_min: float | None = None
+            speed_max: float | None = None
+            radius_count = 0
+            radius_total = 0.0
+            radius_min: float | None = None
+            radius_max: float | None = None
+            type_counts: dict[str, int] = {}
+            solid_volume_m3 = 0.0
+            mass_total = 0.0
+            mass_count = 0
+
+            for values in atom_rows:
+                raw: dict[str, float] = {}
+                for key, value in zip(atom_header, values):
+                    try:
+                        raw[key] = float(value)
+                    except ValueError:
+                        continue
+                x = _dump_coord(raw, "x", bounds)
+                y = _dump_coord(raw, "y", bounds)
+                z = _dump_coord(raw, "z", bounds)
+                if x is not None and y is not None and z is not None:
+                    _update_bounds(mins, maxs, x, y, z)
+                    pos_sum[0] += x
+                    pos_sum[1] += y
+                    pos_sum[2] += z
+                    pos_count += 1
+                if {"vx", "vy", "vz"}.issubset(raw):
+                    speed = math.sqrt(raw["vx"] ** 2 + raw["vy"] ** 2 + raw["vz"] ** 2)
+                    speed_total += speed
+                    speed_count += 1
+                    speed_min = speed if speed_min is None else min(speed_min, speed)
+                    speed_max = speed if speed_max is None else max(speed_max, speed)
+                radius = None
+                if "radius" in raw:
+                    radius = raw["radius"]
+                elif "diameter" in raw:
+                    radius = raw["diameter"] / 2.0
+                elif "diam" in raw:
+                    radius = raw["diam"] / 2.0
+                if radius is not None and radius >= 0:
+                    radius_total += radius
+                    radius_count += 1
+                    radius_min = radius if radius_min is None else min(radius_min, radius)
+                    radius_max = radius if radius_max is None else max(radius_max, radius)
+                    solid_volume_m3 += 4.0 / 3.0 * math.pi * radius ** 3
+                if "type" in raw:
+                    type_key = str(int(raw["type"])) if raw["type"].is_integer() else str(raw["type"])
+                    type_counts[type_key] = type_counts.get(type_key, 0) + 1
+                if "mass" in raw:
+                    mass_total += raw["mass"]
+                    mass_count += 1
+
+            particle_bounds = _bounds_record(mins, maxs)
+            bbox_volume = None
+            solid_fraction = None
+            if particle_bounds:
+                sx, sy, sz = particle_bounds["size"]
+                bbox_volume = sx * sy * sz
+                if bbox_volume > 0 and solid_volume_m3 > 0:
+                    solid_fraction = solid_volume_m3 / bbox_volume
+            frame = {
+                "timestep": timestep,
+                "atom_count": len(atom_rows),
+                "expected_atom_count": atom_count_expected,
+                "box_bounds": bounds,
+                "particle_bounds": particle_bounds,
+                "centroid": [value / pos_count for value in pos_sum] if pos_count else None,
+                "type_counts": type_counts,
+                "speed": _running_stat_summary(speed_count, speed_total, speed_min, speed_max),
+                "radius": _running_stat_summary(radius_count, radius_total, radius_min, radius_max),
+                "solid_volume_m3": solid_volume_m3 if radius_count else None,
+                "mass_total": mass_total if mass_count else None,
+                "particle_bbox_volume_m3": bbox_volume,
+                "particle_bbox_solid_fraction": solid_fraction,
+            }
+            frames.append(frame)
+
+    atom_counts = [frame["atom_count"] for frame in frames if isinstance(frame.get("atom_count"), int)]
+    timesteps = [frame["timestep"] for frame in frames]
+    global_mins = [math.inf, math.inf, math.inf]
+    global_maxs = [-math.inf, -math.inf, -math.inf]
+    for frame in frames:
+        bounds = frame.get("particle_bounds")
+        if not bounds:
+            continue
+        for idx, axis in enumerate(("x", "y", "z")):
+            global_mins[idx] = min(global_mins[idx], bounds[axis][0])
+            global_maxs[idx] = max(global_maxs[idx], bounds[axis][1])
+
+    return {
+        "input_path": str(path),
+        "size_bytes": path.stat().st_size,
+        "bytes_read": min(bytes_read, max_bytes),
+        "max_bytes": max_bytes,
+        "frame_count_analyzed": len(frames),
+        "truncated_by_bytes": truncated_by_bytes,
+        "truncated_by_frames": truncated_by_frames,
+        "timesteps": timesteps,
+        "atom_count_min": min(atom_counts) if atom_counts else None,
+        "atom_count_max": max(atom_counts) if atom_counts else None,
+        "atom_count_last": atom_counts[-1] if atom_counts else None,
+        "global_particle_bounds": _bounds_record(global_mins, global_maxs),
+        "last_frame": frames[-1] if frames else None,
+        "frames": frames,
+    }
+
+
+def _write_metrics_csv(path: Path, metrics: dict) -> None:
+    fields = [
+        "timestep",
+        "atom_count",
+        "centroid_x",
+        "centroid_y",
+        "centroid_z",
+        "z_min",
+        "z_max",
+        "speed_mean",
+        "speed_max",
+        "radius_mean",
+        "solid_volume_m3",
+        "particle_bbox_solid_fraction",
+    ]
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for frame in metrics.get("frames", []):
+            centroid = frame.get("centroid") or [None, None, None]
+            bounds = frame.get("particle_bounds")
+            speed = frame.get("speed") or {}
+            radius = frame.get("radius") or {}
+            writer.writerow(
+                {
+                    "timestep": frame.get("timestep"),
+                    "atom_count": frame.get("atom_count"),
+                    "centroid_x": centroid[0],
+                    "centroid_y": centroid[1],
+                    "centroid_z": centroid[2],
+                    "z_min": bounds["z"][0] if bounds else None,
+                    "z_max": bounds["z"][1] if bounds else None,
+                    "speed_mean": speed.get("mean"),
+                    "speed_max": speed.get("max"),
+                    "radius_mean": radius.get("mean"),
+                    "solid_volume_m3": frame.get("solid_volume_m3"),
+                    "particle_bbox_solid_fraction": frame.get("particle_bbox_solid_fraction"),
+                }
+            )
+
+
+def _choose_dump_relpath(run_id: str, dump_relpath: str | None = None) -> str:
+    if dump_relpath is not None:
+        path = _resolve_run_path(run_id, dump_relpath)
+        if not path.is_file():
+            raise FileNotFoundError(f"dump not found: {dump_relpath}")
+        return str(_validate_relpath(dump_relpath, "dump_relpath"))
+    records = list_output_details(run_id, patterns=["*.dump", "*.lammpstrj", "post/*"])
+    dump_records = [record for record in records if record["kind"] == "dump"]
+    if not dump_records:
+        raise FileNotFoundError(f"no dump files found in run {run_id}")
+    dump_records.sort(key=lambda rec: (rec["size_bytes"], rec["relpath"]), reverse=True)
+    return dump_records[0]["relpath"]
+
+
+def _markdown_report(report: dict) -> str:
+    summary = report.get("summary", {})
+    log = summary.get("log", {})
+    metrics = report.get("dump_metrics")
+    assets = report.get("case_assets", {})
+    visual = report.get("visual_outputs", {})
+    lines = [
+        f"# LIGGGHTS Run Report: {report.get('run_id')}",
+        "",
+        f"- Generated at: {report.get('generated_at')}",
+        f"- Status: {summary.get('status')}",
+        f"- Exit code: {summary.get('exit_code')}",
+        f"- Duration seconds: {summary.get('duration_seconds')}",
+        f"- Output files: {summary.get('output_count')}",
+        f"- Warnings/errors: {log.get('warning_count')} / {log.get('error_count')}",
+        "",
+        "## Last Thermo",
+        "",
+        "```json",
+        json.dumps(log.get("last_thermo"), indent=2),
+        "```",
+        "",
+        "## Case Assets",
+        "",
+        f"- Asset check ok: {assets.get('ok')}",
+        f"- Referenced inputs: {len(assets.get('references', []))}",
+        f"- Missing required inputs: {len(assets.get('missing_required', []))}",
+        f"- Mesh files: {len(assets.get('meshes', []))}",
+        "",
+        "## Visualization",
+        "",
+        f"- Visual output count: {visual.get('visual_output_count')}",
+        f"- Visual bytes: {visual.get('total_visual_bytes')}",
+    ]
+    if metrics:
+        last = metrics.get("last_frame") or {}
+        bounds = last.get("particle_bounds") or {}
+        lines.extend(
+            [
+                "",
+                "## Dump Metrics",
+                "",
+                f"- Input: {metrics.get('input_relpath')}",
+                f"- Frames analyzed: {metrics.get('frame_count_analyzed')}",
+                f"- Last atom count: {metrics.get('atom_count_last')}",
+                f"- Last timestep: {last.get('timestep')}",
+                f"- Last z bounds: {bounds.get('z')}",
+                f"- Last solid fraction in particle bbox: {last.get('particle_bbox_solid_fraction')}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Key Outputs",
+            "",
+        ]
+    )
+    for record in summary.get("outputs", [])[:20]:
+        lines.append(
+            f"- `{record.get('relpath')}` ({record.get('kind')}, {record.get('size_bytes')} bytes)"
+        )
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _slugify(value: str, fallback: str = "run") -> str:
@@ -1163,6 +2072,110 @@ def validate_deck(
 
 
 @mcp.tool()
+def create_dem_case(
+    case_type: str = "angle_of_repose",
+    name: str | None = None,
+    particle_count: int = 1000,
+    particle_diameter_m: float = 0.002,
+    material_density_kg_m3: float = 2500.0,
+    material: dict | None = None,
+    domain: dict | None = None,
+    run_steps: int = 10000,
+    settle_steps: int = 10000,
+    timestep_s: float = 1.0e-5,
+    dump_every: int = 1000,
+    write_case: bool = True,
+    start: bool = False,
+    num_procs: int = 1,
+    overwrite: bool = False,
+    mpirun: str = "mpirun",
+) -> dict:
+    """Create a structured starter DEM case and optionally launch it.
+
+    Supported `case_type` values are:
+      - `angle_of_repose`: open pile settling on a floor
+      - `box_settle`: particles settle inside primitive box walls
+      - `silo_discharge`: primitive cylindrical silo starter deck
+
+    The generated deck is intentionally conservative and editable. For
+    production geometry, use it as a scaffold, add real mesh/data assets, then
+    call `validate_case_assets` before launching.
+    """
+    if write_case or start:
+        _ensure_write_allowed("create_dem_case")
+    _validate_rank_count(num_procs, "num_procs")
+    deck, metadata = _build_dem_case_deck(
+        case_type=case_type,
+        particle_count=particle_count,
+        particle_diameter_m=particle_diameter_m,
+        material_density_kg_m3=material_density_kg_m3,
+        material=material,
+        domain=domain,
+        run_steps=run_steps,
+        settle_steps=settle_steps,
+        timestep_s=timestep_s,
+        dump_every=dump_every,
+    )
+    findings = _estimate_deck(deck, num_procs=num_procs)
+    run_id = _slugify(name or f"{metadata['case_type']}_{uuid.uuid4().hex[:8]}")
+    result = {
+        "run_id": run_id,
+        "case_type": metadata["case_type"],
+        "deck": deck,
+        "metadata": metadata,
+        "validation": findings,
+        "written": False,
+        "started": False,
+    }
+    if not write_case and not start:
+        return result
+
+    _ensure_concurrency_capacity(1 if start else 0)
+    wd = _prepare_run_dir(run_id, overwrite)
+    wd.mkdir(parents=True)
+    (wd / "input.in").write_text(deck)
+    (wd / "case.json").write_text(json.dumps(metadata, indent=2))
+    result.update(
+        {
+            "written": True,
+            "work_dir": str(wd),
+            "input_relpath": "input.in",
+            "case_metadata_relpath": "case.json",
+        }
+    )
+    if not start:
+        status = {
+            "run_id": run_id,
+            "status": "created",
+            "kind": "create_dem_case",
+            "created_at": _now_iso(),
+            "work_dir": str(wd),
+            "input_relpath": "input.in",
+            "case_type": metadata["case_type"],
+        }
+        _write_status(wd, status)
+        result["status"] = status
+        return result
+
+    _validate_deck_safety(deck)
+    cmd = _liggghts_cmd(["-in", "input.in"], num_procs, mpirun)
+    status = _launch(
+        wd,
+        cmd,
+        run_id=run_id,
+        extra_status={
+            "kind": "create_dem_case",
+            "case_type": metadata["case_type"],
+            "num_procs": num_procs,
+            "mpi_ranks": num_procs,
+            **_mpi_status_fields(num_procs, mpirun),
+        },
+    )
+    result.update({"started": True, "status": status})
+    return result
+
+
+@mcp.tool()
 def start_simulation(
     input_script: str,
     num_procs: int = 1,
@@ -1320,6 +2333,102 @@ def clone_run(
 
 
 @mcp.tool()
+def resume_from_restart(
+    source_run_id: str,
+    restart_relpath: str | None = None,
+    new_name: str | None = None,
+    continuation_script: str = "",
+    run_steps: int = 0,
+    num_procs: int = 1,
+    start: bool = True,
+    overwrite: bool = False,
+    mpirun: str = "mpirun",
+) -> dict:
+    """Create a continuation case from a restart file and optionally launch it.
+
+    If `restart_relpath` is omitted, the newest restart-like file in the source
+    run is selected. The tool copies non-output case assets from the source run
+    plus the selected restart, writes a new `input.in` beginning with
+    `read_restart`, appends `continuation_script`, and appends `run run_steps`
+    when `run_steps > 0`.
+    """
+    _ensure_write_allowed("resume_from_restart")
+    _validate_rank_count(num_procs, "num_procs")
+    run_steps = _nonnegative_int(run_steps, "run_steps")
+    src = _run_dir(source_run_id)
+    if not src.is_dir():
+        raise FileNotFoundError(f"source run not found: {source_run_id}")
+    selected_restart = _choose_restart_relpath(source_run_id, restart_relpath)
+    if continuation_script:
+        _validate_deck_safety(continuation_script)
+    body = continuation_script.strip()
+    deck_lines = [f"read_restart    {selected_restart}"]
+    if body:
+        deck_lines.append("")
+        deck_lines.append(body)
+    if run_steps > 0:
+        deck_lines.append("")
+        deck_lines.append(f"run             {run_steps}")
+    deck = "\n".join(deck_lines).rstrip() + "\n"
+    _validate_deck_safety(deck)
+    _ensure_concurrency_capacity(1 if start else 0)
+
+    run_id = _slugify(new_name or f"{source_run_id}_resume_{uuid.uuid4().hex[:6]}")
+    dst = _prepare_run_dir(run_id, overwrite)
+    _copy_run_tree_for_resume(src, dst, selected_restart)
+    (dst / "input.in").write_text(deck)
+    metadata = {
+        "kind": "resume_from_restart",
+        "source_run_id": source_run_id,
+        "restart_relpath": selected_restart,
+        "run_steps": run_steps,
+        "continuation_script_present": bool(body),
+        "created_at": _now_iso(),
+    }
+    (dst / "resume.json").write_text(json.dumps(metadata, indent=2))
+
+    if not start:
+        status = {
+            "run_id": run_id,
+            "status": "created",
+            "work_dir": str(dst),
+            **metadata,
+        }
+        _write_status(dst, status)
+        return {
+            "run_id": run_id,
+            "status": status,
+            "started": False,
+            "input_relpath": "input.in",
+            "restart_relpath": selected_restart,
+            "work_dir": str(dst),
+            "deck": deck,
+        }
+
+    cmd = _liggghts_cmd(["-in", "input.in"], num_procs, mpirun)
+    status = _launch(
+        dst,
+        cmd,
+        run_id=run_id,
+        extra_status={
+            **metadata,
+            "num_procs": num_procs,
+            "mpi_ranks": num_procs,
+            **_mpi_status_fields(num_procs, mpirun),
+        },
+    )
+    return {
+        "run_id": run_id,
+        "status": status,
+        "started": True,
+        "input_relpath": "input.in",
+        "restart_relpath": selected_restart,
+        "work_dir": str(dst),
+        "deck": deck,
+    }
+
+
+@mcp.tool()
 def start_from_dir(
     case_dir: str,
     deck_relpath: str,
@@ -1416,6 +2525,112 @@ def start_from_dir(
 
 
 @mcp.tool()
+def validate_case_assets(
+    run_id: str | None = None,
+    case_dir: str | None = None,
+    deck_relpath: str = "input.in",
+    hash_files: bool = True,
+    inspect_meshes: bool = True,
+) -> dict:
+    """Validate a case directory's deck, referenced assets, and mesh metadata.
+
+    Provide either `run_id` or `case_dir`. The tool checks deck syntax/linting,
+    resolves common input references (`include`, `read_data`, `read_restart`,
+    and `fix mesh/surface ... file ...`), reports missing required files, and
+    optionally inspects STL/OBJ bounds for mesh sanity.
+    """
+    if bool(run_id) == bool(case_dir):
+        raise ValueError("provide exactly one of run_id or case_dir")
+    if run_id:
+        root = _run_dir(run_id)
+        if not root.is_dir():
+            raise FileNotFoundError(f"run not found: {run_id}")
+    else:
+        root = Path(case_dir or "").expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"case_dir not a directory: {case_dir}")
+        _ensure_allowed_case_path(root)
+    deck_rel = _validate_relpath(deck_relpath, "deck_relpath")
+    deck_path = (root / deck_rel).resolve()
+    if not _stays_inside(deck_path, root):
+        raise ValueError("deck_relpath escapes case dir")
+    warnings: list[str] = []
+    missing_required: list[dict] = []
+    references: list[dict] = []
+    assets: list[dict] = []
+    meshes: list[dict] = []
+    deck_text = ""
+    deck_validation: dict | None = None
+
+    if not deck_path.is_file():
+        missing_required.append(
+            {
+                "line": None,
+                "kind": "deck",
+                "path": str(deck_rel),
+                "resolved_path": str(deck_path),
+            }
+        )
+    else:
+        deck_text = deck_path.read_text()
+        deck_validation = _estimate_deck(deck_text)
+        deck_dir = deck_path.parent
+        for ref in _deck_asset_refs(deck_text):
+            ref_path = _resolve_case_relpath(root, deck_dir, ref["path"])
+            inside = _stays_inside(ref_path, root)
+            exists = ref_path.is_file()
+            record = {
+                **ref,
+                "resolved_path": str(ref_path),
+                "inside_case_dir": inside,
+                "exists": exists,
+            }
+            if exists:
+                try:
+                    record["relpath"] = str(ref_path.relative_to(root))
+                except ValueError:
+                    record["relpath"] = ref["path"]
+            references.append(record)
+            if ref.get("required") and not exists:
+                missing_required.append(record)
+            if ref.get("required") and not inside:
+                warnings.append(
+                    f"line {ref['line']}: {ref['kind']} points outside the case dir"
+                )
+
+    for path in _discover_case_assets(root):
+        assets.append(_asset_record(path, root, hash_file=hash_files))
+        if inspect_meshes and path.suffix.lower() in {".stl", ".obj"}:
+            mesh_info = _inspect_mesh_file(path)
+            if mesh_info:
+                meshes.append(
+                    {
+                        "relpath": str(path.relative_to(root)),
+                        "path": str(path),
+                        **mesh_info,
+                    }
+                )
+
+    deck_errors = deck_validation.get("errors", []) if deck_validation else []
+    result = {
+        "run_id": run_id,
+        "case_dir": str(root),
+        "deck_relpath": str(deck_rel),
+        "deck_exists": deck_path.is_file(),
+        "deck_validation": deck_validation,
+        "references": references,
+        "missing_required": missing_required,
+        "assets": assets,
+        "asset_count": len(assets),
+        "meshes": meshes,
+        "mesh_count": len(meshes),
+        "warnings": warnings,
+    }
+    result["ok"] = bool(deck_path.is_file()) and not deck_errors and not missing_required
+    return result
+
+
+@mcp.tool()
 def check_status(run_id: str) -> dict:
     """Return running/finished/unknown for a run, plus last log line and exit code.
 
@@ -1471,7 +2686,13 @@ _DEFAULT_OUTPUT_PATTERNS = (
     "visualization/*",
     "visualization/**/*",
     "converted/*",
+    "converted/**/*",
+    "analysis/*",
+    "analysis/**/*",
     "artifacts/*",
+    "artifacts/**/*",
+    "reports/*",
+    "reports/**/*",
     "*.png",
     "*.jpg",
     "*.jpeg",
@@ -1492,6 +2713,10 @@ _SIM_OUTPUT_PATTERNS = (
     "*.vtu",
     "*.restart",
     "post/*",
+    "analysis/*",
+    "analysis/**/*",
+    "reports/*",
+    "reports/**/*",
 )
 
 
@@ -1526,6 +2751,10 @@ def _classify_output(path: Path) -> str:
         return "image"
     if suffix in {".mp4", ".avi", ".mov"}:
         return "animation"
+    if "analysis" in path.parts:
+        return "analysis"
+    if "reports" in path.parts or suffix == ".md":
+        return "report"
     if suffix in {".csv", ".json"}:
         return "summary"
     if "visualization" in path.parts:
@@ -1757,6 +2986,53 @@ def parse_log(run_id: str, max_bytes: int | None = None) -> dict:
         "size_bytes": log.stat().st_size,
         **_parse_log_text(text, truncated=truncated),
     }
+
+
+@mcp.tool()
+def analyze_dump_metrics(
+    run_id: str,
+    input_relpath: str | None = None,
+    max_frames: int = 50,
+    max_bytes: int | None = None,
+    write_files: bool = True,
+    output_prefix: str | None = None,
+    overwrite: bool = False,
+) -> dict:
+    """Analyze a LIGGGHTS/LAMMPS custom dump and export frame-level metrics.
+
+    Extracts atom counts, particle bounds, centroid, type counts, velocity
+    magnitude statistics, radius statistics, estimated solid volume, and an
+    approximate particle-bounding-box solid fraction when radius/diameter data
+    is present.
+    """
+    if write_files:
+        _ensure_write_allowed("analyze_dump_metrics")
+    limit = max_bytes if max_bytes is not None else _max_analysis_bytes()
+    if limit < 1:
+        raise ValueError("max_bytes must be >= 1")
+    configured_limit = _max_analysis_bytes()
+    if limit > configured_limit:
+        raise ValueError(
+            f"max_bytes exceeds LIGGGHTS_MAX_ANALYSIS_BYTES ({configured_limit})"
+        )
+    relpath = _choose_dump_relpath(run_id, input_relpath)
+    path = _resolve_run_path(run_id, relpath)
+    metrics = _parse_dump_metrics(path, max_frames=max_frames, max_bytes=limit)
+    metrics.update({"run_id": run_id, "input_relpath": relpath})
+
+    if not write_files:
+        return metrics
+
+    stem = _slugify(output_prefix or Path(relpath).stem, "dump")
+    json_relpath = f"analysis/{stem}_metrics.json"
+    csv_relpath = f"analysis/{stem}_metrics.csv"
+    json_path = _prepare_run_output_path(run_id, json_relpath, overwrite=overwrite)
+    csv_path = _prepare_run_output_path(run_id, csv_relpath, overwrite=overwrite)
+    json_path.write_text(json.dumps(metrics, indent=2))
+    _write_metrics_csv(csv_path, metrics)
+    metrics["metrics_json_relpath"] = str(json_path.relative_to(_run_dir(run_id)))
+    metrics["metrics_csv_relpath"] = str(csv_path.relative_to(_run_dir(run_id)))
+    return metrics
 
 
 @mcp.tool()
@@ -2216,6 +3492,69 @@ def summarize_visual_outputs(run_id: str) -> dict:
     }
 
 
+@mcp.tool()
+def generate_run_report(
+    run_id: str,
+    include_dump_metrics: bool = True,
+    dump_relpath: str | None = None,
+    metric_max_frames: int = 50,
+    output_dir: str = "reports",
+    report_name: str = "report",
+    overwrite: bool = False,
+) -> dict:
+    """Generate reproducible JSON and Markdown reports for one run."""
+    _ensure_write_allowed("generate_run_report")
+    output_root_rel = _validate_relpath(output_dir, "output_dir")
+    report_slug = _slugify(report_name, "report")
+    json_relpath = str(output_root_rel / f"{report_slug}.json")
+    md_relpath = str(output_root_rel / f"{report_slug}.md")
+    json_path = _prepare_run_output_path(run_id, json_relpath, overwrite=overwrite)
+    md_path = _prepare_run_output_path(run_id, md_relpath, overwrite=overwrite)
+
+    summary = summarize_run(run_id, max_outputs=100)
+    try:
+        assets = validate_case_assets(run_id=run_id)
+    except FileNotFoundError as e:
+        assets = {"ok": False, "error": str(e)}
+    visual = summarize_visual_outputs(run_id)
+    dump_metrics = None
+    metric_error = None
+    if include_dump_metrics:
+        try:
+            relpath = _choose_dump_relpath(run_id, dump_relpath)
+            path = _resolve_run_path(run_id, relpath)
+            dump_metrics = _parse_dump_metrics(
+                path,
+                max_frames=metric_max_frames,
+                max_bytes=_max_analysis_bytes(),
+            )
+            dump_metrics.update({"run_id": run_id, "input_relpath": relpath})
+        except (FileNotFoundError, ValueError) as e:
+            metric_error = str(e)
+
+    report = {
+        "run_id": run_id,
+        "generated_at": _now_iso(),
+        "server_version": __version__,
+        "summary": summary,
+        "case_assets": assets,
+        "visual_outputs": visual,
+        "dump_metrics": dump_metrics,
+        "dump_metrics_error": metric_error,
+    }
+    json_path.write_text(json.dumps(report, indent=2))
+    md_path.write_text(_markdown_report(report))
+    return {
+        "run_id": run_id,
+        "json_relpath": str(json_path.relative_to(_run_dir(run_id))),
+        "markdown_relpath": str(md_path.relative_to(_run_dir(run_id))),
+        "include_dump_metrics": include_dump_metrics,
+        "dump_metrics_error": metric_error,
+        "summary_status": summary.get("status"),
+        "output_count": summary.get("output_count"),
+    }
+
+
 @mcp.resource("liggghts://config", mime_type="application/json")
 def config_resource() -> dict:
     """Current server configuration and safety limits."""
@@ -2234,6 +3573,7 @@ def config_resource() -> dict:
         "max_concurrent_runs": _max_concurrent_runs(),
         "max_sweep_cases": _max_sweep_cases(),
         "max_read_bytes": _max_read_bytes(),
+        "max_analysis_bytes": _max_analysis_bytes(),
         "visualization_timeout": _vis_timeout(),
         "allowed_case_roots": [str(root) for root in _allowed_case_roots()],
     }

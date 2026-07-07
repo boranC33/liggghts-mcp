@@ -26,6 +26,7 @@ class ServerTestCase(unittest.TestCase):
                 "LIGGGHTS_ALLOWED_CASE_ROOTS",
                 "LIGGGHTS_MAX_SWEEP_CASES",
                 "LIGGGHTS_MAX_READ_BYTES",
+                "LIGGGHTS_MAX_ANALYSIS_BYTES",
                 "LIGGGHTS_ALLOW_DECK_SHELL",
                 "LIGGGHTS_VALIDATE_TIMEOUT_MAX",
                 "LIGGGHTS_VIS_TIMEOUT",
@@ -402,6 +403,148 @@ class ServerTestCase(unittest.TestCase):
         self.assertTrue(result["ovito_python"]["probe"]["ok"])
         self.assertEqual(result["pvpython"]["bin"], str(pv))
         self.assertTrue(result["pvpython"]["probe"]["ok"])
+
+    def test_create_dem_case_writes_structured_case(self):
+        result = server.create_dem_case(
+            case_type="box_settle",
+            name="box_case",
+            particle_count=25,
+            run_steps=0,
+            settle_steps=0,
+            dump_every=10,
+            start=False,
+        )
+
+        wd = server.RUNS / "box_case"
+        self.assertTrue(result["written"])
+        self.assertFalse(result["started"])
+        self.assertEqual(result["status"]["status"], "created")
+        self.assertTrue((wd / "input.in").exists())
+        self.assertTrue((wd / "case.json").exists())
+        deck = (wd / "input.in").read_text()
+        self.assertIn("fix             mcp_insert all insert/pack", deck)
+        self.assertIn("dump            mcp_dump all custom 10", deck)
+        self.assertTrue(result["validation"]["ok"])
+
+    def test_validate_case_assets_resolves_mesh_and_bounds(self):
+        wd = self._run_dir()
+        (wd / "mesh.stl").write_text(
+            "solid box\n"
+            "  facet normal 0 0 1\n"
+            "    outer loop\n"
+            "      vertex 0 0 0\n"
+            "      vertex 1 0 0\n"
+            "      vertex 0 1 0\n"
+            "    endloop\n"
+            "  endfacet\n"
+            "endsolid box\n"
+        )
+        (wd / "input.in").write_text(
+            "units si\n"
+            "atom_style granular\n"
+            "fix cad all mesh/surface file mesh.stl type 1\n"
+            "run 0\n"
+        )
+
+        result = server.validate_case_assets(run_id="run1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mesh_count"], 1)
+        self.assertEqual(result["missing_required"], [])
+        self.assertEqual(result["references"][0]["relpath"], "mesh.stl")
+        self.assertEqual(result["meshes"][0]["bounds"]["x"], [0.0, 1.0])
+
+    def test_resume_from_restart_prepares_continuation_case(self):
+        src = self._run_dir("base")
+        (src / "input.in").write_text(self._minimal_deck())
+        (src / "wall.stl").write_text("solid empty\nendsolid empty\n")
+        (src / "restart.1000.liggghts").write_text("restart bytes")
+        (src / "particles.dump").write_text("old output")
+
+        result = server.resume_from_restart(
+            "base",
+            new_name="base_resume",
+            continuation_script="thermo 10",
+            run_steps=50,
+            start=False,
+        )
+
+        dst = server.RUNS / "base_resume"
+        self.assertFalse(result["started"])
+        self.assertTrue((dst / "restart.1000.liggghts").exists())
+        self.assertTrue((dst / "wall.stl").exists())
+        self.assertFalse((dst / "particles.dump").exists())
+        deck = (dst / "input.in").read_text()
+        self.assertIn("read_restart    restart.1000.liggghts", deck)
+        self.assertIn("thermo 10", deck)
+        self.assertIn("run             50", deck)
+
+    def test_analyze_dump_metrics_writes_json_and_csv(self):
+        wd = self._run_dir()
+        (wd / "particles.lammpstrj").write_text(
+            "ITEM: TIMESTEP\n"
+            "0\n"
+            "ITEM: NUMBER OF ATOMS\n"
+            "2\n"
+            "ITEM: BOX BOUNDS pp pp pp\n"
+            "0 1\n"
+            "0 1\n"
+            "0 1\n"
+            "ITEM: ATOMS id type x y z vx vy vz radius\n"
+            "1 1 0.1 0.2 0.3 1.0 0.0 0.0 0.01\n"
+            "2 2 0.4 0.5 0.8 0.0 2.0 0.0 0.02\n"
+        )
+
+        result = server.analyze_dump_metrics(
+            "run1",
+            "particles.lammpstrj",
+            output_prefix="particles",
+            overwrite=True,
+        )
+
+        self.assertEqual(result["frame_count_analyzed"], 1)
+        self.assertEqual(result["atom_count_last"], 2)
+        self.assertEqual(result["last_frame"]["particle_bounds"]["z"], [0.3, 0.8])
+        self.assertAlmostEqual(result["last_frame"]["speed"]["max"], 2.0)
+        self.assertTrue((wd / "analysis" / "particles_metrics.json").exists())
+        self.assertTrue((wd / "analysis" / "particles_metrics.csv").exists())
+
+    def test_generate_run_report_writes_markdown_and_json(self):
+        wd = self._run_dir()
+        (wd / "status.json").write_text(
+            '{"run_id":"run1","status":"finished","exit_code":0,'
+            '"started_at":"2026-01-01T00:00:00+00:00",'
+            '"finished_at":"2026-01-01T00:00:01+00:00"}'
+        )
+        (wd / "input.in").write_text(self._minimal_deck())
+        (wd / "log.run").write_text(
+            "Step Atoms Temp\n"
+            "0 2 0.0\n"
+            "Loop time of 0.1 on 1 procs for 0 steps with 2 atoms\n"
+        )
+        (wd / "particles.lammpstrj").write_text(
+            "ITEM: TIMESTEP\n"
+            "0\n"
+            "ITEM: NUMBER OF ATOMS\n"
+            "1\n"
+            "ITEM: BOX BOUNDS pp pp pp\n"
+            "0 1\n"
+            "0 1\n"
+            "0 1\n"
+            "ITEM: ATOMS id type x y z radius\n"
+            "1 1 0.2 0.2 0.4 0.01\n"
+        )
+        (wd / "visualization").mkdir()
+        (wd / "visualization" / "preview.png").write_text("png")
+
+        result = server.generate_run_report("run1", overwrite=True)
+
+        self.assertEqual(result["summary_status"], "finished")
+        self.assertTrue((wd / "reports" / "report.json").exists())
+        self.assertTrue((wd / "reports" / "report.md").exists())
+        report = (wd / "reports" / "report.json").read_text()
+        self.assertIn('"dump_metrics"', report)
+        self.assertIn("LIGGGHTS Run Report", (wd / "reports" / "report.md").read_text())
 
     def test_stop_simulation_uses_sigkill_for_stubborn_process_group(self):
         wd = self._run_dir("stubborn")

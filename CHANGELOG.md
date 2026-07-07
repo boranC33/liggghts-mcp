@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0
+
+- Added structured case generation via `create_dem_case` for
+  angle-of-repose, box-settling, and simple silo-discharge starter workflows.
+- Added case asset validation via `validate_case_assets`, including deck
+  reference checks, file hashes, and STL/OBJ mesh bounds.
+- Added restart continuation workflow via `resume_from_restart`.
+- Added dump metric extraction via `analyze_dump_metrics`, with JSON/CSV
+  exports for frame-level particle bounds, centroid, velocity, radius, solid
+  volume, and approximate solid fraction.
+- Added reproducible run reports via `generate_run_report`.
+- Added `LIGGGHTS_MAX_ANALYSIS_BYTES` to bound dump reads during analysis.
+
 ## 0.6.0
 
 - Added deck output augmentation via `ensure_standard_outputs`.
