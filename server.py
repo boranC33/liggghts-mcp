@@ -20,7 +20,7 @@ from pathlib import Path
 
 mcp = FastMCP("liggghts")
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 LIGGGHTS_BIN = os.environ.get("LIGGGHTS_BIN", "/usr/local/bin/liggghts")
 RUNS = Path(os.environ.get("LIGGGHTS_RUNS", Path.home() / "liggghts_runs"))
@@ -754,7 +754,7 @@ def _build_dem_case_deck(
     else:
         radius_wall = min(box["width_m"], box["depth_m"]) * 0.45
         wall_lines = [
-            f"fix             mcp_silo_wall all wall/gran model hertz tangential history primitive type 1 zcylinder {_fmt(radius_wall)}",
+            f"fix             mcp_silo_wall all wall/gran model hertz tangential history primitive type 1 zcylinder {_fmt(radius_wall)} 0.0 0.0",
             "fix             mcp_bottom all wall/gran model hertz tangential history primitive type 1 zplane 0.0",
         ]
         insertion_lines = [

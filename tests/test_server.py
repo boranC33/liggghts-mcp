@@ -426,6 +426,19 @@ class ServerTestCase(unittest.TestCase):
         self.assertIn("dump            mcp_dump all custom 10", deck)
         self.assertTrue(result["validation"]["ok"])
 
+        silo = server.create_dem_case(
+            case_type="silo_discharge",
+            particle_count=25,
+            run_steps=0,
+            settle_steps=0,
+            write_case=False,
+            start=False,
+        )
+        self.assertRegex(
+            silo["deck"],
+            r"zcylinder\s+[0-9.eE+-]+\s+0\.0\s+0\.0",
+        )
+
     def test_validate_case_assets_resolves_mesh_and_bounds(self):
         wd = self._run_dir()
         (wd / "mesh.stl").write_text(

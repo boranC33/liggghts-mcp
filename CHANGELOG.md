@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1
+
+- Fixed the generated `silo_discharge` starter deck so primitive `zcylinder`
+  walls include the required cylinder-axis coordinates.
+- Added regression coverage for the `silo_discharge` wall syntax.
+
 ## 0.7.0
 
 - Added structured case generation via `create_dem_case` for
